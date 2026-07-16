@@ -1,13 +1,17 @@
-import { dirname, join } from 'node:path';
+import { mkdtempSync, realpathSync } from 'node:fs';
+import { rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'pathe';
 import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
 import { KimiError } from '../../src/errors';
-import { StdioMcpClient } from '../../src/mcp/client-stdio';
+import { mergeStdioEnv, StdioMcpClient } from '../../src/mcp/client-stdio';
 
 const here = import.meta.dirname;
 const fixture = join(here, 'fixtures', 'mock-stdio-server.mjs');
+const cwdFixture = join(here, 'fixtures', 'cwd-stdio-server.mjs');
 const stderrThenExitFixture = join(here, 'fixtures', 'stderr-then-exit-stdio-server.mjs');
 const crashAfterConnectFixture = join(here, 'fixtures', 'crash-after-connect-stdio-server.mjs');
 
@@ -33,6 +37,51 @@ describe('StdioMcpClient', () => {
     }
     expect(thrown).toBeInstanceOf(KimiError);
   });
+
+  it('uses defaultCwd when config.cwd is omitted', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'kimi-mcp-default-cwd-'));
+    const client = new StdioMcpClient(
+      {
+        transport: 'stdio',
+        command: process.execPath,
+        args: [cwdFixture],
+      },
+      { defaultCwd: cwd },
+    );
+    try {
+      await client.connect();
+      const result = await client.callTool('get_cwd', {});
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+      expect(realpathSync(text)).toBe(realpathSync(cwd));
+    } finally {
+      await client.close();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  it('prefers explicit config.cwd over defaultCwd', async () => {
+    const defaultCwd = mkdtempSync(join(tmpdir(), 'kimi-mcp-default-cwd-'));
+    const configuredCwd = mkdtempSync(join(tmpdir(), 'kimi-mcp-configured-cwd-'));
+    const client = new StdioMcpClient(
+      {
+        transport: 'stdio',
+        command: process.execPath,
+        args: [cwdFixture],
+        cwd: configuredCwd,
+      },
+      { defaultCwd },
+    );
+    try {
+      await client.connect();
+      const result = await client.callTool('get_cwd', {});
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+      expect(realpathSync(text)).toBe(realpathSync(configuredCwd));
+    } finally {
+      await client.close();
+      await rm(defaultCwd, { recursive: true, force: true });
+      await rm(configuredCwd, { recursive: true, force: true });
+    }
+  }, 15000);
 
   it('connects, lists tools, and round-trips a text result', async () => {
     const client = new StdioMcpClient({
@@ -154,7 +203,7 @@ describe('StdioMcpClient', () => {
       transport: 'stdio',
       command: process.execPath,
       args: [crashAfterConnectFixture],
-      env: { KIMI_TEST_MCP_EXIT_AFTER_MS: '50', KIMI_TEST_MCP_STDERR: banner },
+      env: { KIMI_TEST_MCP_EXIT_AFTER_MS: '500', KIMI_TEST_MCP_STDERR: banner },
     });
     const closes: Array<{ stderr?: string; error?: string }> = [];
     client.onUnexpectedClose((reason) => {
@@ -245,4 +294,25 @@ describe('StdioMcpClient', () => {
     await new Promise((r) => setTimeout(r, 100));
     expect(closes).toEqual([]);
   }, 15000);
+});
+
+describe('mergeStdioEnv', () => {
+  it('enables NODE_USE_ENV_PROXY for a proxy set only in the server config.env', () => {
+    const merged = mergeStdioEnv({ HTTP_PROXY: 'http://corp:3128' }, { PATH: '/usr/bin' });
+    expect(merged['HTTP_PROXY']).toBe('http://corp:3128');
+    expect(merged['NODE_USE_ENV_PROXY']).toBe('1');
+    expect(merged['NO_PROXY']).toBe('localhost,127.0.0.1,::1,[::1]');
+    expect(merged['PATH']).toBe('/usr/bin');
+  });
+
+  it('does not inject NODE_USE_ENV_PROXY when no proxy is configured', () => {
+    const merged = mergeStdioEnv(undefined, { PATH: '/usr/bin' });
+    expect(merged['NODE_USE_ENV_PROXY']).toBeUndefined();
+    expect(merged['PATH']).toBe('/usr/bin');
+  });
+
+  it('lets config.env override the parent env', () => {
+    const merged = mergeStdioEnv({ FOO: 'override' }, { FOO: 'parent', PATH: '/x' });
+    expect(merged['FOO']).toBe('override');
+  });
 });

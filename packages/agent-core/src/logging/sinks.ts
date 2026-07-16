@@ -1,6 +1,6 @@
 import { mkdir, open, rename, stat, unlink } from 'node:fs/promises';
 import { appendFileSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname } from 'pathe';
 
 import { syncDir } from '#/utils/fs';
 
@@ -35,7 +35,6 @@ export class RotatingFileSink implements Sink {
   private pending: string[] = [];
   private dropped = 0;
   private closed = false;
-  private failed = false;
   private lastStderrNotice = 0;
   private currentBytes = -1;
   private directorySynced = false;
@@ -103,7 +102,6 @@ export class RotatingFileSink implements Sink {
         this.directorySynced = true;
       }
 
-      this.failed = false;
       return true;
     } catch (error) {
       this.noteFailure(error);
@@ -212,7 +210,6 @@ export class RotatingFileSink implements Sink {
   }
 
   private noteFailure(error: unknown): void {
-    this.failed = true;
     const now = Date.now();
     if (now - this.lastStderrNotice < STDERR_NOTICE_INTERVAL_MS) return;
     this.lastStderrNotice = now;

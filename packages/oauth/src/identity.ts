@@ -7,12 +7,15 @@
  * production state.
  */
 
+import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { arch, hostname, release, type } from 'node:os';
 import { join } from 'node:path';
 
 import type { DeviceHeaders } from './types';
+
+export const KIMI_CODE_PLATFORM = 'kimi_code_cli';
 
 export interface KimiHostIdentity {
   readonly userAgentProduct: string;
@@ -29,24 +32,28 @@ export interface CreateKimiDeviceIdOptions {
   readonly onFirstLaunch?: ((id: string) => void) | undefined;
 }
 
+export function readKimiDeviceId(homeDir: string): string | null {
+  const deviceIdPath = join(homeDir, 'device_id');
+  if (!existsSync(deviceIdPath)) return null;
+  try {
+    const text = readFileSync(deviceIdPath, 'utf-8').trim();
+    return text.length > 0 ? text : null;
+  } catch {
+    return null;
+  }
+}
+
 export function createKimiDeviceId(
   homeDir: string,
   options: CreateKimiDeviceIdOptions = {},
 ): string {
-  const deviceIdPath = join(homeDir, 'device_id');
-  if (existsSync(deviceIdPath)) {
-    try {
-      const text = readFileSync(deviceIdPath, 'utf-8').trim();
-      if (text.length > 0) return text;
-    } catch {
-      // Fall through to regenerate.
-    }
-  }
+  const existing = readKimiDeviceId(homeDir);
+  if (existing !== null) return existing;
 
   const id = randomUUID();
   try {
     mkdirSync(homeDir, { recursive: true, mode: 0o700 });
-    writeFileSync(deviceIdPath, id, { encoding: 'utf-8', mode: 0o600 });
+    writeFileSync(join(homeDir, 'device_id'), id, { encoding: 'utf-8', mode: 0o600 });
   } catch {
     // Best-effort: requests can still use the in-memory id.
   }
@@ -65,7 +72,7 @@ export function createKimiDeviceHeaders(options: {
   readonly version: string;
 }): DeviceHeaders {
   return {
-    'X-Msh-Platform': 'kimi-code-cli',
+    'X-Msh-Platform': KIMI_CODE_PLATFORM,
     'X-Msh-Version': requiredAsciiHeader(options.version, 'Kimi identity version'),
     'X-Msh-Device-Name': asciiHeader(hostname()),
     'X-Msh-Device-Model': asciiHeader(deviceModel()),
@@ -98,6 +105,38 @@ export function createKimiDefaultHeaders(options: KimiIdentityOptions): Record<s
   };
 }
 
+/**
+ * Env var carrying extra headers applied to every outbound provider request
+ * (LLM chat and `/models` listing). Mirrors `ANTHROPIC_CUSTOM_HEADERS`:
+ * newline-separated `Name: Value` lines; lines without a colon are skipped;
+ * names and values are trimmed.
+ *
+ * These headers form the lowest-precedence layer — the Kimi identity headers
+ * (User-Agent, X-Msh-*), per-provider `customHeaders`, and request auth
+ * (Authorization) all override them.
+ *
+ * Unlike the device identity headers above, this is intentionally
+ * environment-derived and stateless (re-read on every call) so callers can
+ * apply it uniformly without plumbing the value through every host layer.
+ */
+export const KIMI_CODE_CUSTOM_HEADERS_ENV = 'KIMI_CODE_CUSTOM_HEADERS';
+
+export function parseKimiCodeCustomHeaders(
+  env: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const raw = env[KIMI_CODE_CUSTOM_HEADERS_ENV]?.trim();
+  if (raw === undefined || raw.length === 0) return {};
+  const headers: Record<string, string> = {};
+  for (const line of raw.split('\n')) {
+    const colon = line.indexOf(':');
+    if (colon < 0) continue;
+    const name = line.slice(0, colon).trim();
+    if (name.length === 0) continue;
+    headers[name] = line.slice(colon + 1).trim();
+  }
+  return headers;
+}
+
 export function assertKimiHostIdentity(identity: KimiHostIdentity | undefined): KimiHostIdentity {
   if (identity === undefined) {
     throw new Error('Kimi host identity is required. Pass the host product name and version.');
@@ -111,9 +150,21 @@ function deviceModel(): string {
   const os = type();
   const version = release();
   const osArch = arch();
-  if (os === 'Darwin') return `macOS ${version} ${osArch}`;
+  if (os === 'Darwin') return `macOS ${macOsProductVersion() ?? version} ${osArch}`;
   if (os === 'Windows_NT') return `Windows ${version} ${osArch}`;
   return `${os} ${version} ${osArch}`.trim();
+}
+
+function macOsProductVersion(): string | undefined {
+  try {
+    const version = execFileSync('/usr/bin/sw_vers', ['-productVersion'], {
+      encoding: 'utf-8',
+      timeout: 1000,
+    }).trim();
+    return version.length > 0 ? version : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function asciiHeader(value: string, fallback = 'unknown'): string {

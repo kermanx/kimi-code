@@ -1,11 +1,13 @@
 import { promises as fs } from 'node:fs';
-import path from 'node:path';
+import path from 'pathe';
 
 import { SkillParseError, UnsupportedSkillTypeError, parseSkillFromFile } from './parser';
 import type { SkillDefinition, SkillRoot, SkillSource, SkippedSkill } from './types';
 import { normalizeSkillName } from './types';
 
-const USER_BRAND_DIRS = ['.kimi-code/skills'] as const;
+// Relative to brandHomeDir, which already IS the brand data dir (~/.kimi-code or
+// $KIMI_CODE_HOME) — no '.kimi-code' segment here, or it would nest twice.
+const USER_BRAND_DIRS = ['skills'] as const;
 const USER_GENERIC_DIRS = ['.agents/skills'] as const;
 const PROJECT_BRAND_DIRS = ['.kimi-code/skills'] as const;
 const PROJECT_GENERIC_DIRS = ['.agents/skills'] as const;
@@ -16,6 +18,12 @@ const MAX_SKILL_SCAN_DEPTH = 8;
 
 export interface SkillPathContext {
   readonly userHomeDir: string;
+  /**
+   * Brand data dir — `KIMI_CODE_HOME`, or `<userHomeDir>/.kimi-code` by default.
+   * User brand skills live directly under here as `skills/`, so this path
+   * carries no `.kimi-code` segment of its own (that would double the prefix).
+   */
+  readonly brandHomeDir?: string;
   readonly workDir: string;
 }
 
@@ -24,6 +32,7 @@ export interface ResolveSkillRootsOptions {
   readonly builtinDir?: string;
   readonly explicitDirs?: readonly string[];
   readonly extraDirs?: readonly string[];
+  readonly pluginSkillRoots?: readonly SkillRoot[];
   readonly mergeAllAvailableSkills?: boolean;
   readonly realpath?: (p: string) => Promise<string>;
   readonly isDir?: (p: string) => Promise<boolean>;
@@ -33,6 +42,7 @@ export interface DiscoverSkillsOptions {
   readonly roots: readonly SkillRoot[];
   readonly onWarning?: (message: string, cause?: unknown) => void;
   readonly onSkippedByPolicy?: (skill: SkippedSkill) => void;
+  readonly onDiscoveredSkill?: (skill: SkillDefinition) => void;
   readonly readdir?: (p: string) => Promise<readonly string[]>;
   readonly isFile?: (p: string) => Promise<boolean>;
   readonly isDir?: (p: string) => Promise<boolean>;
@@ -52,10 +62,13 @@ export async function resolveSkillRoots(
   options: ResolveSkillRootsOptions,
 ): Promise<readonly SkillRoot[]> {
   const isDir = options.isDir ?? defaultIsDir;
-  const realpath = options.realpath ?? ((p: string) => fs.realpath(p));
+  const realpath =
+    options.realpath ??
+    ((p: string) => fs.realpath(p).then((r) => r.replaceAll('\\', '/')));
   const roots: SkillRoot[] = [];
   const mergeAllAvailableSkills = options.mergeAllAvailableSkills ?? true;
   const { userHomeDir, workDir } = options.paths;
+  const brandHomeDir = options.paths.brandHomeDir ?? path.join(userHomeDir, '.kimi-code');
   const projectRoot = await findProjectRoot(workDir);
 
   if (options.explicitDirs !== undefined && options.explicitDirs.length > 0) {
@@ -82,7 +95,7 @@ export async function resolveSkillRoots(
     await pushBrandGroup(
       roots,
       USER_BRAND_DIRS,
-      userHomeDir,
+      brandHomeDir,
       'user',
       mergeAllAvailableSkills,
       isDir,
@@ -101,6 +114,12 @@ export async function resolveSkillRoots(
       isDir,
       realpath,
     );
+  }
+
+  if (options.pluginSkillRoots !== undefined) {
+    for (const root of options.pluginSkillRoots) {
+      await pushProvidedRoot(roots, root, isDir, realpath);
+    }
   }
 
   if (options.builtinDir !== undefined) {
@@ -123,9 +142,10 @@ export async function discoverSkills(
 
   async function walkSkillDir(
     dirPath: string,
-    source: SkillSource,
+    root: SkillRoot,
     isTopLevel: boolean,
     depth: number,
+    subSkillParentName?: string,
   ): Promise<void> {
     if (depth > MAX_SKILL_SCAN_DEPTH) return;
 
@@ -142,31 +162,56 @@ export async function discoverSkills(
     const directorySkills = new Set<string>();
     const subdirs: string[] = [];
     for (const entry of entries) {
-      // A directory holding SKILL.md is a skill bundle: register it and do not
-      // descend, so its bundled references/scripts are never scanned.
-      if (await isFile(path.join(dirPath, entry, 'SKILL.md'))) {
+      const entryPath = path.join(dirPath, entry);
+      // A directory holding SKILL.md is a skill bundle: register it, then keep
+      // descending so nested SKILL.md bundles remain discoverable as sub-skills.
+      if (await isFile(path.join(entryPath, 'SKILL.md'))) {
         directorySkills.add(entry);
-        continue;
       }
       if (entry === 'node_modules' || entry.startsWith('.')) continue;
-      if (await isDir(path.join(dirPath, entry))) subdirs.push(entry);
+      if (await isDir(entryPath)) subdirs.push(entry);
     }
 
+    const allowedSubSkillBundles = new Map<string, string>();
     for (const entry of directorySkills) {
-      await parseAndRegister({
+      const skill = await parseAndRegister({
         parse,
         byName,
         skillMdPath: path.join(dirPath, entry, 'SKILL.md'),
         skillDirName: entry,
-        source,
+        root,
+        onDiscoveredSkill: options.onDiscoveredSkill,
         warn,
         skip,
+        subSkillParentName,
       });
+      if (skill !== undefined && hasSubSkillEnabled(skill)) {
+        allowedSubSkillBundles.set(entry, skill.name);
+      }
     }
 
     // Flat .md skills count only at a root's top level; deeper .md files are
     // skill payload (e.g. references/foo.md), not skills.
     if (isTopLevel) {
+      // A SKILL.md placed directly at a plugin skill root (e.g. plugin root fallback)
+      // is treated as a single skill bundle. This only applies to plugin-derived roots,
+      // not to user/project skill directories.
+      if (root.plugin !== undefined) {
+        const rootSkillMd = path.join(dirPath, 'SKILL.md');
+        if (await isFile(rootSkillMd)) {
+          await parseAndRegister({
+            parse,
+            byName,
+            skillMdPath: rootSkillMd,
+            skillDirName: path.basename(dirPath),
+            root,
+            onDiscoveredSkill: options.onDiscoveredSkill,
+            warn,
+            skip,
+          });
+        }
+      }
+
       for (const entry of entries) {
         if (!entry.endsWith('.md')) continue;
         if (entry === 'SKILL.md') continue;
@@ -184,7 +229,8 @@ export async function discoverSkills(
           byName,
           skillMdPath,
           skillDirName: skillName,
-          source,
+          root,
+          onDiscoveredSkill: options.onDiscoveredSkill,
           warn,
           skip,
         });
@@ -192,12 +238,20 @@ export async function discoverSkills(
     }
 
     for (const entry of subdirs) {
-      await walkSkillDir(path.join(dirPath, entry), source, false, depth + 1);
+      if (directorySkills.has(entry) && !allowedSubSkillBundles.has(entry)) continue;
+      const allowedSubSkillParentName = allowedSubSkillBundles.get(entry);
+      await walkSkillDir(
+        path.join(dirPath, entry),
+        root,
+        false,
+        depth + 1,
+        allowedSubSkillParentName ?? subSkillParentName,
+      );
     }
   }
 
   for (const root of options.roots) {
-    await walkSkillDir(root.path, root.source, true, 0);
+    await walkSkillDir(root.path, root, true, 0);
   }
 
   return sortSkills([...byName.values()]);
@@ -285,23 +339,65 @@ async function pushExistingRoot(
   return true;
 }
 
+async function pushProvidedRoot(
+  out: SkillRoot[],
+  root: SkillRoot,
+  isDir: (p: string) => Promise<boolean>,
+  realpath: (p: string) => Promise<string>,
+): Promise<boolean> {
+  if (!(await isDir(root.path))) return false;
+  const resolved = await realpath(root.path);
+  const existingIndex = out.findIndex((existing) => existing.path === resolved);
+  if (existingIndex < 0) {
+    out.push({ ...root, path: resolved });
+    return true;
+  }
+  const existing = out[existingIndex];
+  if (existing !== undefined && existing.plugin === undefined && root.plugin !== undefined) {
+    out[existingIndex] = { ...existing, plugin: root.plugin };
+  }
+  return true;
+}
+
 async function parseAndRegister(input: {
   readonly parse: NonNullable<DiscoverSkillsOptions['parse']>;
   readonly byName: Map<string, SkillDefinition>;
   readonly skillMdPath: string;
   readonly skillDirName: string;
-  readonly source: SkillSource;
+  readonly root: SkillRoot;
+  readonly onDiscoveredSkill?: (skill: SkillDefinition) => void;
   readonly warn: (message: string, cause?: unknown) => void;
   readonly skip: (skill: SkippedSkill) => void;
-}): Promise<void> {
+  readonly subSkillParentName?: string;
+}): Promise<SkillDefinition | undefined> {
   try {
-    const skill = await input.parse({
+    const parsed = await input.parse({
       skillMdPath: input.skillMdPath,
       skillDirName: input.skillDirName,
-      source: input.source,
+      source: input.root.source,
     });
-    const key = normalizeSkillName(skill.name);
-    if (!input.byName.has(key)) input.byName.set(key, skill);
+    const subSkillParentName = input.subSkillParentName;
+    const skill =
+      subSkillParentName !== undefined
+        ? {
+            ...parsed,
+            name: qualifySubSkillName(subSkillParentName, parsed.name),
+            metadata: {
+              ...parsed.metadata,
+              isSubSkill: true,
+            },
+          }
+        : parsed;
+    const discovered = input.root.plugin === undefined ? skill : {
+      ...skill,
+      plugin: input.root.plugin,
+    };
+    input.onDiscoveredSkill?.(discovered);
+    const key = normalizeSkillName(discovered.name);
+    if (!input.byName.has(key)) {
+      input.byName.set(key, discovered);
+    }
+    return discovered;
   } catch (error) {
     if (error instanceof UnsupportedSkillTypeError) {
       input.skip({
@@ -314,7 +410,27 @@ async function parseAndRegister(input: {
     } else {
       input.warn(`Skipping skill at ${input.skillMdPath} due to unexpected error`, error);
     }
+    return undefined;
   }
+}
+
+function qualifySubSkillName(parentName: string, skillName: string): string {
+  if (skillName === parentName || skillName.startsWith(`${parentName}.`)) return skillName;
+  return `${parentName}.${skillName}`;
+}
+
+function hasSubSkillEnabled(skill: SkillDefinition): boolean {
+  const nested = skill.metadata['metadata'];
+  const nestedFlag =
+    typeof nested === 'object' && nested !== null
+      ? (nested as Record<string, unknown>)['has-sub-skill'] === true ||
+        (nested as Record<string, unknown>)['hasSubSkill'] === true
+      : false;
+  return (
+    skill.metadata['has-sub-skill'] === true ||
+    skill.metadata['hasSubSkill'] === true ||
+    nestedFlag
+  );
 }
 
 async function defaultIsDir(p: string): Promise<boolean> {

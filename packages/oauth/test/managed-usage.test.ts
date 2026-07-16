@@ -5,11 +5,26 @@ import {
   formatDuration,
   formatResetTime,
   isManagedKimiCode,
+  kimiCodeBaseUrl,
+  kimiCodeUsageUrl,
   parseManagedUsagePayload,
 } from '../src/managed-usage';
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
+});
+
+describe('kimiCodeBaseUrl', () => {
+  it('strips trailing slashes from the KIMI_CODE_BASE_URL override', () => {
+    // The env value must be normalized at the source: provision persists it
+    // verbatim while the model refresh rewrites it normalized, and the
+    // deep-equal diff between the two shapes would fire a spurious
+    // providers-changed event mid-login.
+    vi.stubEnv('KIMI_CODE_BASE_URL', 'https://gw.example.com/');
+    expect(kimiCodeBaseUrl()).toBe('https://gw.example.com');
+    expect(kimiCodeUsageUrl()).toBe('https://gw.example.com/usages');
+  });
 });
 
 describe('isManagedKimiCode', () => {
@@ -25,8 +40,8 @@ describe('isManagedKimiCode', () => {
 
 describe('parseManagedUsagePayload', () => {
   it('returns empty when payload is not an object', () => {
-    expect(parseManagedUsagePayload(null)).toEqual({ summary: null, limits: [] });
-    expect(parseManagedUsagePayload('nope')).toEqual({ summary: null, limits: [] });
+    expect(parseManagedUsagePayload(null)).toEqual({ summary: null, limits: [], extraUsage: null });
+    expect(parseManagedUsagePayload('nope')).toEqual({ summary: null, limits: [], extraUsage: null });
   });
 
   it('extracts a summary from the `usage` object', () => {
@@ -74,6 +89,73 @@ describe('parseManagedUsagePayload', () => {
     const parsed = parseManagedUsagePayload({ usage: { used: 1, limit: 10, resetAt: future } });
     expect(parsed.summary?.resetHint).toMatch(/resets in/);
   });
+
+  it('extracts extra usage from boosterWallet.balance', () => {
+    const parsed = parseManagedUsagePayload({
+      usage: { used: 40, limit: 1000, name: 'Weekly limit' },
+      boosterWallet: {
+        id: 'wallet_1',
+        balance: {
+          type: 'BOOSTER',
+          amount: '20000000000',
+          amountLeft: '10000000000',
+          unit: 'UNIT_CURRENCY',
+        },
+        monthlyChargeLimitEnabled: true,
+        monthlyChargeLimit: { currency: 'USD', priceInCents: '20000' },
+        monthlyUsed: { currency: 'USD', priceInCents: '5000' },
+      },
+    });
+    expect(parsed.extraUsage).toEqual({
+      balanceCents: 10000,
+      totalCents: 20000,
+      monthlyChargeLimitEnabled: true,
+      monthlyChargeLimitCents: 20000,
+      monthlyUsedCents: 5000,
+      currency: 'USD',
+    });
+  });
+
+  it('treats missing amountLeft as zero balance', () => {
+    const parsed = parseManagedUsagePayload({
+      usage: { used: 1, limit: 10 },
+      boosterWallet: { balance: { type: 'BOOSTER', amount: '20000000000' } },
+    });
+    expect(parsed.extraUsage).toMatchObject({ totalCents: 20000, balanceCents: 0 });
+  });
+
+  it('defaults monthly limit fields when absent', () => {
+    const parsed = parseManagedUsagePayload({
+      usage: { used: 1, limit: 10 },
+      boosterWallet: {
+        balance: { type: 'BOOSTER', amount: '20000000000', amountLeft: '20000000000' },
+      },
+    });
+    expect(parsed.extraUsage).toEqual({
+      balanceCents: 20000,
+      totalCents: 20000,
+      monthlyChargeLimitEnabled: false,
+      monthlyChargeLimitCents: 0,
+      monthlyUsedCents: 0,
+      currency: 'USD',
+    });
+  });
+
+  it('returns null extra usage when boosterWallet is missing or invalid', () => {
+    expect(parseManagedUsagePayload({ usage: { used: 1, limit: 10 } }).extraUsage).toBeNull();
+    expect(
+      parseManagedUsagePayload({
+        usage: { used: 1, limit: 10 },
+        boosterWallet: { balance: { type: 'OTHER', amount: '100', amountLeft: '50' } },
+      }).extraUsage,
+    ).toBeNull();
+    expect(
+      parseManagedUsagePayload({
+        usage: { used: 1, limit: 10 },
+        boosterWallet: { balance: { type: 'BOOSTER', amount: '0', amountLeft: '0' } },
+      }).extraUsage,
+    ).toBeNull();
+  });
 });
 
 describe('fetchManagedUsage', () => {
@@ -92,6 +174,7 @@ describe('fetchManagedUsage', () => {
       parsed: {
         summary: { label: 'Weekly limit', used: 1, limit: 10 },
         limits: [],
+        extraUsage: null,
       },
     });
 
@@ -102,6 +185,57 @@ describe('fetchManagedUsage', () => {
     expect(headers.get('accept')).toBe('application/json');
     expect(headers.get('user-agent')).toBeNull();
     expect(headers.get('x-msh-platform')).toBeNull();
+  });
+
+  it('surfaces JSON API error messages with status', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ message: 'usage quota unavailable' }), {
+            status: 401,
+            headers: { 'Content-Type': 'application/json' },
+          }),
+      ),
+    );
+
+    const result = await fetchManagedUsage('https://api.example/usages', 'access-token');
+
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.status).toBe(401);
+    expect(result.message).toBe('usage quota unavailable');
+  });
+
+  it('surfaces nested JSON API error messages', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ error: { message: 'usage endpoint moved' } }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json' },
+          }),
+      ),
+    );
+
+    const result = await fetchManagedUsage('https://api.example/usages', 'access-token');
+
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.status).toBe(404);
+    expect(result.message).toBe('usage endpoint moved');
+  });
+
+  it('falls back to local usage hints when the API error body is empty', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 404 })));
+
+    const result = await fetchManagedUsage('https://api.example/usages', 'access-token');
+
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.status).toBe(404);
+    expect(result.message).toBe('Usage endpoint not available. Try Kimi For Coding.');
   });
 });
 

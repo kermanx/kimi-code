@@ -1,5 +1,6 @@
 import {
   APIConnectionError,
+  APIEmptyResponseError,
   APIStatusError,
   APITimeoutError,
   ChatProviderError,
@@ -59,7 +60,6 @@ export function makeErrorPayload(
  * - `APIStatusError`: 429 -> rate_limit, 401 -> auth_error, otherwise -> api_error.
  * - `APIConnectionError` / `APITimeoutError`: connection_error.
  * - `ChatProviderError`: api_error.
- * - Heuristic "Model not set" / "Provider not set" messages: model.not_configured.
  *
  * Anything else collapses to `internal`. We never echo `cause` or stack on
  * the wire.
@@ -84,7 +84,7 @@ export function toKimiErrorPayload(error: unknown): KimiErrorPayload {
           : ErrorCodes.PROVIDER_API_ERROR;
     return {
       code,
-      message: error.message,
+      message: sanitizeStatusErrorMessage(error.message),
       name: error.name,
       details: {
         statusCode: error.statusCode,
@@ -103,6 +103,23 @@ export function toKimiErrorPayload(error: unknown): KimiErrorPayload {
     };
   }
 
+  if (error instanceof APIEmptyResponseError) {
+    const code =
+      error.finishReason === 'filtered'
+        ? ErrorCodes.PROVIDER_FILTERED
+        : ErrorCodes.PROVIDER_API_ERROR;
+    return {
+      code,
+      message: error.message,
+      name: error.name,
+      details: {
+        finishReason: error.finishReason,
+        rawFinishReason: error.rawFinishReason,
+      },
+      retryable: KIMI_ERROR_INFO[code].retryable,
+    };
+  }
+
   if (error instanceof ChatProviderError) {
     return {
       code: ErrorCodes.PROVIDER_API_ERROR,
@@ -113,15 +130,6 @@ export function toKimiErrorPayload(error: unknown): KimiErrorPayload {
   }
 
   if (error instanceof Error) {
-    if (error.message === 'Model not set' || error.message === 'Provider not set') {
-      return {
-        code: ErrorCodes.MODEL_NOT_CONFIGURED,
-        message: error.message,
-        name: error.name,
-        retryable: KIMI_ERROR_INFO[ErrorCodes.MODEL_NOT_CONFIGURED].retryable,
-      };
-    }
-
     return {
       code: ErrorCodes.INTERNAL,
       message: error.message,
@@ -135,6 +143,22 @@ export function toKimiErrorPayload(error: unknown): KimiErrorPayload {
     message: String(error),
     retryable: KIMI_ERROR_INFO[ErrorCodes.INTERNAL].retryable,
   };
+}
+
+/**
+ * Provider status errors occasionally carry an HTML body instead of a
+ * structured message (for example, nginx returning
+ * "413 <html><head><title>413 Request Entity Too Large</title>...</html>").
+ * Extract the `<title>` when present so the wire message is human readable,
+ * and strip carriage returns so the text renders cleanly in terminals — a
+ * trailing `\r` combined with line-end padding would otherwise overwrite
+ * the whole line. The original HTML remains available in logs and `details`.
+ */
+function sanitizeStatusErrorMessage(message: string): string {
+  const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(message);
+  const extracted = titleMatch?.[1]?.trim();
+  const normalized = extracted !== undefined && extracted.length > 0 ? extracted : message;
+  return normalized.replaceAll('\r', '');
 }
 
 /**

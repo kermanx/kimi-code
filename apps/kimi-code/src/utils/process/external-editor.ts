@@ -13,6 +13,8 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { quoteShellArg } from '#/utils/shell-quote';
+
 export function resolveEditorCommand(configured?: string | null): string | undefined {
   const candidates = [configured, process.env['VISUAL'], process.env['EDITOR']];
   for (const c of candidates) {
@@ -28,8 +30,8 @@ export function resolveEditorCommand(configured?: string | null): string | undef
  * with `initialText`. Returns the edited contents on success, or
  * `undefined` if the editor exited non-zero / the file disappeared.
  *
- * The command is passed to `/bin/sh -c "<cmd> <tmpfile>"` so users can
- * supply argv-style strings like `"code --wait"` or `"nvim +set ft=markdown"`.
+ * The command is passed to the system shell (`shell: true`) so users can
+ * supply argv-style strings like `code --wait` or `nvim +"set ft=markdown"`.
  */
 export async function editInExternalEditor(
   initialText: string,
@@ -39,10 +41,13 @@ export async function editInExternalEditor(
   const file = join(dir, 'prompt.md');
   await writeFile(file, initialText, 'utf-8');
   try {
+    const shellCmd = `${command} ${quoteShellArg(file)}`;
     const code = await new Promise<number>((resolve, reject) => {
-      const shellCmd = `${command} ${shellQuote(file)}`;
-      const child = spawn('/bin/sh', ['-c', shellCmd], { stdio: 'inherit' });
-      child.on('exit', (c) =>{  resolve(c ?? 0); });
+      const child = spawn(shellCmd, {
+        stdio: 'inherit',
+        shell: true,
+      });
+      child.on('exit', (c) => { resolve(c ?? 0); });
       child.on('error', reject);
     });
     if (code !== 0) return undefined;
@@ -54,7 +59,3 @@ export async function editInExternalEditor(
   }
 }
 
-function shellQuote(path: string): string {
-  // Single-quote and escape any embedded single quotes.
-  return `'${path.replaceAll('\'', "'\\''")}'`;
-}

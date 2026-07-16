@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { TUIState } from "#/tui/kimi-tui";
+import { darkColors, lightColors } from "#/tui/theme/colors";
+import { getBuiltInPalette } from "#/tui/theme";
 import {
   DISABLE_TERMINAL_THEME_REPORTING,
   ENABLE_TERMINAL_THEME_REPORTING,
@@ -156,5 +158,18 @@ describe("terminal theme tracking", () => {
 
     expect(removeInputListener).toHaveBeenCalledOnce();
     expect(state.terminal.write).toHaveBeenCalledWith(DISABLE_TERMINAL_THEME_REPORTING);
+  });
+});
+
+describe('ColorPalette warning token', () => {
+  it('has a defined warning color in both themes', () => {
+    expect(darkColors.warning).toBeTruthy();
+    expect(lightColors.warning).toBeTruthy();
+    expect(darkColors.warning).not.toBe(lightColors.warning);
+  });
+
+  it('resolves the correct palette by theme name', () => {
+    expect(getBuiltInPalette('dark')).toBe(darkColors);
+    expect(getBuiltInPalette('light')).toBe(lightColors);
   });
 });

@@ -1,5 +1,5 @@
 import { globSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join } from 'pathe';
 
 import { describe, expect, it } from 'vitest';
 
@@ -22,12 +22,16 @@ const SRC = join(import.meta.dirname, '..', 'src');
 // `.md` files rendered through `renderPrompt`. Keep in sync when a new
 // templated prompt file is introduced.
 const TEMPLATED = new Set([
-  'profile/default/system.md',
   'agent/compaction/compaction-instruction.md',
+  'profile/default/system.md',
   'tools/builtin/file/read.md',
   'tools/builtin/file/read-media.md',
   'tools/builtin/shell/bash.md',
-  'tools/builtin/collaboration/skill-tool.md',
+]);
+
+const STATIC_PLACEHOLDER_PROTOCOL_FILES = new Set([
+  'agent/swarm/enter-reminder.md',
+  'tools/builtin/collaboration/agent-swarm.md',
 ]);
 
 const mdFiles = globSync('**/*.md', { cwd: SRC })
@@ -42,6 +46,7 @@ describe('prompt placeholders', () => {
   it('static .md files contain no unrendered template syntax', () => {
     for (const file of mdFiles) {
       if (TEMPLATED.has(file)) continue;
+      if (STATIC_PLACEHOLDER_PROTOCOL_FILES.has(file)) continue;
       const content = readFileSync(join(SRC, file), 'utf-8');
       expect(
         /\{\{|\{%|\$\{/.test(content),

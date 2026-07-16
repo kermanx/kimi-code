@@ -1,6 +1,6 @@
 import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join } from 'pathe';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
@@ -11,7 +11,7 @@ describe('e2e: glob parity boundaries', () => {
   let tempDir: string;
 
   beforeEach(async () => {
-    kaos = new LocalKaos();
+    kaos = await LocalKaos.create();
     tempDir = await realpath(await mkdtemp(join(tmpdir(), 'kaos-glob-')));
     await kaos.chdir(tempDir);
   });

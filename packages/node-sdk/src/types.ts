@@ -1,10 +1,12 @@
 import type {
   ExportSessionManifest,
   ResumeSessionResult,
+  ShellEnvironment,
   TelemetryClient,
   TelemetryContextPatch,
   TelemetryProperties,
 } from '@moonshot-ai/agent-core';
+import type { Kaos } from '@moonshot-ai/kaos';
 import type { KimiHostIdentity, OAuthRefreshOutcome } from '@moonshot-ai/kimi-code-oauth';
 import type { ContentPart } from '@moonshot-ai/kosong';
 
@@ -16,12 +18,25 @@ export type Unsubscribe = () => void;
 
 export type {
   AgentReplayRecord,
+  AgentBackgroundTaskInfo,
   BackgroundConfig,
   BackgroundTaskInfo,
-  BackgroundTaskKind,
   BackgroundTaskStatus,
+  ConfigDiagnostics,
   ContextMessage,
+  CronTaskSnapshot,
+  ExperimentalFeatureState,
+  ExperimentalFlagMap,
+  ExperimentalFlagSource,
   ExportSessionManifest,
+  GoalBudgetLimits,
+  GoalBudgetReport,
+  GoalChange,
+  GoalChangeStats,
+  GetCronTasksResult,
+  GoalSnapshot,
+  GoalStatus,
+  GoalToolResult,
   KimiConfig,
   KimiConfigPatch,
   LoopControl,
@@ -30,11 +45,22 @@ export type {
   ModelAlias,
   MoonshotServiceConfig,
   OAuthRef,
+  PluginCommandDef,
+  PluginGithubMetadata,
+  PluginGithubRef,
+  PluginInfo,
+  PluginMcpServerInfo,
+  PluginSource,
+  PluginSummary,
+  ProcessBackgroundTaskInfo,
   PromptOrigin,
   ProviderConfig,
   ProviderType,
+  QuestionBackgroundTaskInfo,
+  ReloadSummary,
   ResumedAgentState,
   ServicesConfig,
+  ShellEnvironment,
   SkillSummary,
   ThinkingConfig,
   ToolInfo,
@@ -42,9 +68,14 @@ export type {
 
 export type { KimiHostIdentity, OAuthRefreshOutcome };
 export type { TelemetryClient, TelemetryContextPatch, TelemetryProperties };
-export type { ContentPart, Role, ToolCall } from '@moonshot-ai/kosong';
+export type { ContentPart, Role, ThinkingEffort, ToolCall } from '@moonshot-ai/kosong';
 
 export type PermissionMode = 'yolo' | 'manual' | 'auto';
+
+export interface CreateGoalInput {
+  readonly objective: string;
+  readonly replace?: boolean;
+}
 
 export type TextPromptPart = Extract<ContentPart, { type: 'text' }>;
 export type PromptPart = Extract<ContentPart, { type: 'text' | 'image_url' | 'video_url' }>;
@@ -60,6 +91,7 @@ export interface KimiHarnessOptions {
   readonly skillDirs?: readonly string[];
   readonly telemetry?: TelemetryClient | undefined;
   readonly onOAuthRefresh?: ((outcome: OAuthRefreshOutcome) => void) | undefined;
+  readonly sessionStartedProperties?: TelemetryProperties;
 }
 
 export interface CreateSessionOptions {
@@ -70,6 +102,18 @@ export interface CreateSessionOptions {
   readonly permission?: PermissionMode | undefined;
   readonly planMode?: boolean;
   readonly metadata?: JsonObject | undefined;
+  readonly kaos?: Kaos | undefined;
+  readonly persistenceKaos?: Kaos | undefined;
+  readonly additionalDirs?: readonly string[];
+  readonly sessionStartedProperties?: TelemetryProperties;
+  /**
+   * Print-mode (`kimi -p`) only: when the main agent ends a turn while
+   * background subagents (`kind === 'agent'`) are still running, hold the turn
+   * open and idle-wait until they all finish, flushing their completions into
+   * the turn so the model can react before the run exits. Ignored by
+   * interactive / SDK sessions.
+   */
+  readonly drainAgentTasksOnStop?: boolean;
 }
 
 export interface RenameSessionInput {
@@ -79,6 +123,24 @@ export interface RenameSessionInput {
 
 export interface ResumeSessionInput {
   readonly id: string;
+  readonly kaos?: Kaos | undefined;
+  readonly persistenceKaos?: Kaos | undefined;
+  readonly additionalDirs?: readonly string[];
+  readonly sessionStartedProperties?: TelemetryProperties;
+}
+
+export interface ReloadSessionInput extends ResumeSessionInput {
+  readonly forcePluginSessionStartReminder?: boolean;
+}
+
+export interface AddAdditionalDirInput {
+  readonly id: string;
+  readonly path: string;
+  readonly persist: boolean;
+}
+
+export interface AddAdditionalDirOptions {
+  readonly persist: boolean;
 }
 
 export interface ForkSessionInput {
@@ -94,6 +156,9 @@ export interface ExportSessionInput {
   readonly includeGlobalLog?: boolean | undefined;
   /** Host version to record in the export manifest. */
   readonly version: string;
+  /** How the CLI was installed (e.g. 'npm-global', 'native'). */
+  readonly installSource?: string | undefined;
+  readonly shellEnv?: ShellEnvironment | undefined;
 }
 
 export interface ExportSessionResult {
@@ -104,7 +169,8 @@ export interface ExportSessionResult {
 }
 
 export interface ListSessionsOptions {
-  readonly workDir: string;
+  readonly workDir?: string;
+  readonly sessionId?: string;
 }
 
 export interface GetConfigOptions {
@@ -113,6 +179,10 @@ export interface GetConfigOptions {
 
 export interface CompactOptions {
   readonly instruction?: string | undefined;
+}
+
+export interface ReloadSessionOptions {
+  readonly forcePluginSessionStartReminder?: boolean;
 }
 
 export interface PlanInfo {
@@ -138,9 +208,10 @@ export interface SessionUsage {
 
 export interface SessionStatus {
   readonly model?: string;
-  readonly thinkingLevel: string;
+  readonly thinkingEffort: string;
   readonly permission: PermissionMode;
   readonly planMode: boolean;
+  readonly swarmMode?: boolean | undefined;
   readonly contextTokens: number;
   readonly maxContextTokens: number;
   readonly contextUsage: number;
@@ -157,8 +228,16 @@ export interface SessionSummary {
   readonly updatedAt: number;
   readonly archived?: boolean | undefined;
   readonly metadata?: JsonObject | undefined;
+  readonly additionalDirs?: readonly string[];
 }
 
-export type ResumedSessionState = Pick<ResumeSessionResult, 'sessionMetadata' | 'agents'>;
+export interface AddAdditionalDirResult {
+  readonly additionalDirs: readonly string[];
+  readonly projectRoot: string;
+  readonly configPath: string;
+  readonly persisted: boolean;
+}
 
-export interface ResumedSessionSummary extends SessionSummary, ResumedSessionState {}
+export type ResumedSessionState = Pick<ResumeSessionResult, 'sessionMetadata' | 'agents' | 'warning'>;
+
+export interface ResumedSessionSummary extends SessionSummary, ResumedSessionState { }

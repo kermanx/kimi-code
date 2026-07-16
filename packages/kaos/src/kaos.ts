@@ -1,3 +1,4 @@
+import type { Environment } from './environment';
 import type { KaosProcess } from './process';
 import type { StatResult } from './types';
 
@@ -11,6 +12,13 @@ import type { StatResult } from './types';
 export interface Kaos {
   /** Human-readable name for this environment (e.g. `"local"`, `"ssh:host"`). */
   readonly name: string;
+
+  /**
+   * OS / shell probe describing the target environment. Populated by the
+   * concrete Kaos implementation (e.g. `detectEnvironmentFromNode()` for
+   * `LocalKaos`, a remote probe for `SSHKaos`).
+   */
+  readonly osEnv: Environment;
 
   // ── Path operations (sync) ──────────────────────────────────────────
 
@@ -27,6 +35,15 @@ export interface Kaos {
 
   /** Change the working directory to `path`. */
   chdir(path: string): Promise<void>;
+  /** Return a new Kaos with the given `cwd`. */
+  withCwd(cwd: string): Kaos;
+  /**
+   * Return a new Kaos that overlays `env` onto every spawned process.
+   *
+   * The provided record is read when a process is spawned, so callers may
+   * mutate a stable record to update future executions.
+   */
+  withEnv(env: Record<string, string>): Kaos;
   /** Return stat metadata for `path`. */
   stat(path: string, options?: { followSymlinks?: boolean }): Promise<StatResult>;
   /** Yield entry names in the directory at `path`. */

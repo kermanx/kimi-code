@@ -1,6 +1,6 @@
 import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join } from 'pathe';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -75,7 +75,7 @@ describe('plan-mode bootstrap from config.defaultPlanMode', () => {
   async function countPlanModeEnters(): Promise<number> {
     const suffix = join('agents', 'main', 'wire.jsonl');
     const entries = await readdir(homeDir, { recursive: true });
-    const match = entries.find((entry) => entry.endsWith(suffix));
+    const match = entries.find((entry) => entry.replaceAll('\\', '/').endsWith(suffix));
     if (match === undefined) {
       throw new Error('wire.jsonl not found under session home');
     }

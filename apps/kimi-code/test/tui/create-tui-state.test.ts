@@ -8,15 +8,16 @@ function fakeInitialAppState(): AppState {
   return {
     model: 'test-model',
     workDir: '/tmp/kimi-test',
+    additionalDirs: [],
     sessionId: 'sess-1',
-    yolo: false,
     permissionMode: 'manual',
     planMode: false,
-    thinking: false,
+    inputMode: 'prompt',
+    swarmMode: false,
+    thinkingEffort: 'off',
     contextUsage: 0,
     contextTokens: 0,
     maxContextTokens: 0,
-    isStreaming: false,
     isCompacting: false,
     isReplaying: false,
     streamingPhase: 'idle',
@@ -25,9 +26,11 @@ function fakeInitialAppState(): AppState {
     version: '0.0.0-test',
     editorCommand: null,
     notifications: { enabled: true, condition: 'unfocused' },
+    upgrade: { autoInstall: true },
     availableModels: {},
     availableProviders: {},
     sessionTitle: null,
+    mcpServersSummary: null,
   };
 }
 
@@ -38,6 +41,7 @@ describe('createTUIState', () => {
       startup: {
         continueLast: false,
         yolo: false,
+        auto: false,
         plan: false,
       },
     };
@@ -54,15 +58,14 @@ describe('createTUIState', () => {
     expect(state.editor).toBeDefined();
     expect(state.footer).toBeDefined();
     expect(state.todoPanel).toBeDefined();
-    expect(state.theme.colors).toBeDefined();
-    expect(state.theme.markdownTheme).toBeDefined();
+    expect(state.theme.palette).toBeDefined();
 
     // App state is cloned from initialAppState, not reused by reference.
     expect(state.appState).not.toBe(opts.initialAppState);
     expect(state.appState.model).toBe('test-model');
+    expect(state.appState.additionalDirs).toEqual([]);
     expect(state.appState.sessionId).toBe('sess-1');
     expect(state.startupState).toBe('pending');
-    expect(state.startupNotice).toBeUndefined();
 
     // LivePane defaults.
     expect(state.livePane.mode).toBe('idle');
@@ -72,32 +75,13 @@ describe('createTUIState', () => {
     // Empty collections.
     expect(state.transcriptEntries).toHaveLength(0);
     expect(state.queuedMessages).toHaveLength(0);
-    expect(state.pendingToolComponents.size).toBe(0);
-    expect(state.activeToolCalls.size).toBe(0);
-    expect(state.streamingToolCallArguments.size).toBe(0);
-    expect(state.backgroundAgents.size).toBe(0);
-    expect(state.backgroundAgentMetadata.size).toBe(0);
-    expect(state.renderedSkillActivationIds.size).toBe(0);
 
     // Boolean, counter, and optional-field defaults.
     expect(state.toolOutputExpanded).toBe(false);
-    expect(state.showingSessionPicker).toBe(false);
-    expect(state.showingHelpPanel).toBe(false);
+    expect(state.activeDialog).toBeNull();
     expect(state.externalEditorRunning).toBe(false);
     expect(state.loadingSessions).toBe(false);
-    expect(state.currentTurnId).toBeUndefined();
-    expect(state.currentStep).toBe(0);
-    expect(state.assistantStreamActive).toBe(false);
-    expect(state.assistantDraft).toBe('');
-    expect(state.thinkingDraft).toBe('');
-    expect(state.lastHistoryContent).toBeUndefined();
-    expect(state.lastActivityMode).toBeUndefined();
-    expect(state.activitySpinner).toBeUndefined();
-    expect(state.activitySpinnerStyle).toBeUndefined();
-    expect(state.streamingComponent).toBeUndefined();
-    expect(state.streamingTranscriptEntry).toBeUndefined();
-    expect(state.activeCompactionBlock).toBeUndefined();
-    expect(state.pendingAgentGroup).toBeNull();
-    expect(state.pendingReadGroup).toBeNull();
+    expect(state.sessionsScope).toBe('cwd');
+    expect(state.activitySpinner).toBeNull();
   });
 });

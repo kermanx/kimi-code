@@ -1,9 +1,4 @@
-import type {
-  ChatProvider,
-  Message,
-  ModelCapability,
-  Tool,
-} from '@moonshot-ai/kosong';
+import type { ChatProvider, ModelCapability } from '@moonshot-ai/kosong';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -11,19 +6,6 @@ import {
   computeCompletionBudgetCap,
   resolveCompletionBudget,
 } from '../../src/utils/completion-budget';
-
-function makeMessages(approxAsciiTokens: number): Message[] {
-  // estimateTokens treats ASCII as ~4 chars/token. Pad with a single
-  // string so the message lands near the requested count.
-  const charCount = approxAsciiTokens * 4;
-  return [
-    {
-      role: 'user',
-      content: [{ type: 'text', text: 'a'.repeat(charCount) }],
-      toolCalls: [],
-    },
-  ];
-}
 
 function makeCapability(maxContextTokens: number): ModelCapability {
   return {
@@ -36,138 +18,69 @@ function makeCapability(maxContextTokens: number): ModelCapability {
   };
 }
 
-function makeTool(name: string, asciiCharsInDescription: number): Tool {
-  return {
-    name,
-    description: 'd'.repeat(asciiCharsInDescription),
-    parameters: { type: 'object', properties: {} },
-  };
-}
-
 describe('computeCompletionBudgetCap', () => {
-  it('returns desired when context size is unknown', () => {
+  it('uses fallback when context size is unknown and no hard cap is set', () => {
     const cap = computeCompletionBudgetCap({
-      budget: { desired: 8192 },
+      budget: { fallback: 8192 },
       capability: undefined,
-      messages: makeMessages(100),
     });
     expect(cap).toBe(8192);
   });
 
-  it('preserves a small desired when context size is unknown — no artificial floor', () => {
+  it('uses an explicit hard cap when context size is unknown', () => {
     const cap = computeCompletionBudgetCap({
-      budget: { desired: 10 },
+      budget: { hardCap: 10, fallback: 8192 },
       capability: makeCapability(0),
-      messages: makeMessages(100),
     });
     expect(cap).toBe(10);
   });
 
-  it('floors at 1 when desired is zero or negative', () => {
+  it('floors at 1 when hard cap is zero or negative', () => {
     expect(
       computeCompletionBudgetCap({
-        budget: { desired: 0 },
+        budget: { hardCap: 0 },
         capability: undefined,
-        messages: makeMessages(10),
       }),
     ).toBe(1);
     expect(
       computeCompletionBudgetCap({
-        budget: { desired: -100 },
+        budget: { hardCap: -100 },
         capability: undefined,
-        messages: makeMessages(10),
       }),
     ).toBe(1);
   });
 
-  it('clamps desired down to the remaining context window', () => {
-    // max_context_tokens 10000, input ~ 1000, safetyMargin 1024 → remaining ~ 7976
+  it('uses the model context window when no hard cap is set', () => {
+    const maxCtx = 100000;
     const cap = computeCompletionBudgetCap({
-      budget: { desired: 32000 },
-      capability: makeCapability(10000),
-      messages: makeMessages(1000),
-    });
-    expect(cap).toBeLessThanOrEqual(10000 - 1000 - 1024);
-    expect(cap).toBeGreaterThan(7000);
-  });
-
-  it('returns 1 when input already exceeds context minus margin', () => {
-    const cap = computeCompletionBudgetCap({
-      budget: { desired: 32000 },
-      capability: makeCapability(10000),
-      messages: makeMessages(11000),
-    });
-    expect(cap).toBe(1);
-  });
-
-  it('never exceeds remaining context, even when remaining is below the historical floor', () => {
-    // input ~ 8900, safetyMargin 1024 → remaining ~ 75 (positive but below 256).
-    // The cap MUST stay <= remaining so the request does not overflow.
-    const maxCtx = 10000;
-    const cap = computeCompletionBudgetCap({
-      budget: { desired: 32000 },
+      budget: { fallback: 32000 },
       capability: makeCapability(maxCtx),
-      messages: makeMessages(8900),
     });
-    expect(cap).toBeGreaterThanOrEqual(1);
-    expect(cap).toBeLessThanOrEqual(maxCtx - 8900 - 1024);
+    expect(cap).toBe(maxCtx);
   });
 
-  it('respects custom safetyMargin', () => {
+  it('uses the explicit hard cap when configured', () => {
     const cap = computeCompletionBudgetCap({
-      budget: { desired: 32000, safetyMargin: 4096 },
-      capability: makeCapability(20000),
-      messages: makeMessages(1000),
+      budget: { hardCap: 32000 },
+      capability: makeCapability(10000),
     });
-    // remaining = 20000 - (1000 + 1 for 'user' role) - 4096 = 14903
-    expect(cap).toBe(14903);
+    expect(cap).toBe(32000);
   });
 
-  it('keeps desired when smaller than remaining', () => {
+  it('ignores fallback when the model context window is known', () => {
     const cap = computeCompletionBudgetCap({
-      budget: { desired: 1024 },
+      budget: { fallback: 32000 },
+      capability: makeCapability(10000),
+    });
+    expect(cap).toBe(10000);
+  });
+
+  it('keeps explicit hard cap when smaller than remaining', () => {
+    const cap = computeCompletionBudgetCap({
+      budget: { hardCap: 1024 },
       capability: makeCapability(100000),
-      messages: makeMessages(1000),
     });
     expect(cap).toBe(1024);
-  });
-
-  it('counts the system prompt as input', () => {
-    const maxCtx = 10000;
-    const safetyMargin = 1024;
-    const systemPrompt = 'a'.repeat(2000 * 4); // ~2000 tokens
-    const cap = computeCompletionBudgetCap({
-      budget: { desired: 32000, safetyMargin },
-      capability: makeCapability(maxCtx),
-      messages: makeMessages(1000),
-      systemPrompt,
-    });
-    // remaining = 10000 - (1001 + 2000) - 1024 = 5975
-    expect(cap).toBeLessThanOrEqual(maxCtx - 1001 - 2000 - safetyMargin);
-    expect(cap).toBeGreaterThan(5500);
-  });
-
-  it('counts tool schemas as input', () => {
-    const maxCtx = 10000;
-    const safetyMargin = 1024;
-    const tools: Tool[] = [
-      makeTool('tool_a', 4000), // ~1000 tokens of description per tool
-      makeTool('tool_b', 4000),
-    ];
-    const capWithTools = computeCompletionBudgetCap({
-      budget: { desired: 32000, safetyMargin },
-      capability: makeCapability(maxCtx),
-      messages: makeMessages(1000),
-      tools,
-    });
-    const capWithoutTools = computeCompletionBudgetCap({
-      budget: { desired: 32000, safetyMargin },
-      capability: makeCapability(maxCtx),
-      messages: makeMessages(1000),
-    });
-    expect(capWithTools).toBeLessThan(capWithoutTools);
-    // Tool descriptions add ~2000 tokens, so cap should drop by roughly that.
-    expect(capWithoutTools - capWithTools).toBeGreaterThan(1500);
   });
 });
 
@@ -198,7 +111,6 @@ describe('applyCompletionBudget', () => {
       provider: original,
       budget: undefined,
       capability: makeCapability(10000),
-      messages: makeMessages(100),
     });
     expect(result).toBe(original);
     expect(withMaxCompletionTokens).not.toHaveBeenCalled();
@@ -210,48 +122,33 @@ describe('applyCompletionBudget', () => {
     const opaque = rest as unknown as ChatProvider;
     const result = applyCompletionBudget({
       provider: opaque,
-      budget: { desired: 8192 },
+      budget: { hardCap: 8192 },
       capability: makeCapability(10000),
-      messages: makeMessages(100),
     });
     expect(result).toBe(opaque);
   });
 
-  it('clones the provider with the clamped cap when budget is configured', () => {
+  it('clones the provider with the model context window when budget is configured', () => {
     const result = applyCompletionBudget({
       provider: original,
-      budget: { desired: 32000 },
+      budget: { fallback: 32000 },
       capability: makeCapability(10000),
-      messages: makeMessages(1000),
     });
     expect(withMaxCompletionTokens).toHaveBeenCalledOnce();
     const cap = withMaxCompletionTokens.mock.calls[0]?.[0] as number;
-    expect(cap).toBeLessThanOrEqual(10000 - 1000 - 1024);
-    expect(cap).toBeGreaterThan(7000);
+    expect(cap).toBe(10000);
     expect(result).not.toBe(original);
   });
 
-  it('forwards systemPrompt and tools to the cap computation', () => {
-    const tools: Tool[] = [makeTool('tool_a', 4000)];
-    const systemPrompt = 'a'.repeat(4000); // ~1000 tokens
-    applyCompletionBudget({
+  it('uses the explicit hard cap when configured', () => {
+    const result = applyCompletionBudget({
       provider: original,
-      budget: { desired: 32000 },
+      budget: { hardCap: 8192 },
       capability: makeCapability(10000),
-      messages: makeMessages(1000),
-      systemPrompt,
-      tools,
     });
-    const capWithExtras = withMaxCompletionTokens.mock.calls[0]?.[0] as number;
-    withMaxCompletionTokens.mockClear();
-    applyCompletionBudget({
-      provider: original,
-      budget: { desired: 32000 },
-      capability: makeCapability(10000),
-      messages: makeMessages(1000),
-    });
-    const capBare = withMaxCompletionTokens.mock.calls[0]?.[0] as number;
-    expect(capWithExtras).toBeLessThan(capBare);
+    expect(withMaxCompletionTokens).toHaveBeenCalledOnce();
+    expect(withMaxCompletionTokens.mock.calls[0]?.[0]).toBe(8192);
+    expect(result).not.toBe(original);
   });
 });
 
@@ -264,7 +161,7 @@ describe('resolveCompletionBudget', () => {
         KIMI_MODEL_MAX_TOKENS: '2048',
       },
     });
-    expect(budget?.desired).toBe(4096);
+    expect(budget?.hardCap).toBe(4096);
   });
 
   it('falls back to legacy KIMI_MODEL_MAX_TOKENS when the new var is unset', () => {
@@ -272,20 +169,32 @@ describe('resolveCompletionBudget', () => {
       reservedContextSize: 1000,
       env: { KIMI_MODEL_MAX_TOKENS: '2048' },
     });
-    expect(budget?.desired).toBe(2048);
+    expect(budget?.hardCap).toBe(2048);
   });
 
-  it('uses reservedContextSize when no env var is set', () => {
+  it('uses reservedContextSize as the unknown-context fallback when no env var is set', () => {
     const budget = resolveCompletionBudget({
       reservedContextSize: 12345,
       env: {},
     });
-    expect(budget?.desired).toBe(12345);
+    expect(budget?.hardCap).toBeUndefined();
+    expect(budget?.fallback).toBe(12345);
   });
 
-  it('falls back to the historical default 32000 when nothing is configured', () => {
+  it('uses model max output size as the default hard cap when no env var is set', () => {
+    const budget = resolveCompletionBudget({
+      maxOutputSize: 384000,
+      reservedContextSize: 12345,
+      env: {},
+    });
+    expect(budget?.hardCap).toBe(384000);
+    expect(budget?.fallback).toBeUndefined();
+  });
+
+  it('falls back to 32000 only for unknown context when nothing is configured', () => {
     const budget = resolveCompletionBudget({ env: {} });
-    expect(budget?.desired).toBe(32000);
+    expect(budget?.hardCap).toBeUndefined();
+    expect(budget?.fallback).toBe(32000);
   });
 
   it('ignores reservedContextSize when it is 0', () => {
@@ -293,7 +202,8 @@ describe('resolveCompletionBudget', () => {
       reservedContextSize: 0,
       env: {},
     });
-    expect(budget?.desired).toBe(32000);
+    expect(budget?.hardCap).toBeUndefined();
+    expect(budget?.fallback).toBe(32000);
   });
 
   it('treats non-positive KIMI_MODEL_MAX_COMPLETION_TOKENS as an opt-out', () => {
@@ -327,13 +237,14 @@ describe('resolveCompletionBudget', () => {
         KIMI_MODEL_MAX_TOKENS: '-1',
       },
     });
-    expect(budget?.desired).toBe(4096);
+    expect(budget?.hardCap).toBe(4096);
   });
 
   it('falls back to defaults when the env var is non-numeric garbage', () => {
     const budget = resolveCompletionBudget({
       env: { KIMI_MODEL_MAX_COMPLETION_TOKENS: 'not-a-number' },
     });
-    expect(budget?.desired).toBe(32000);
+    expect(budget?.hardCap).toBeUndefined();
+    expect(budget?.fallback).toBe(32000);
   });
 });

@@ -23,7 +23,7 @@ export function useDeleteSession() {
     mutationFn: (sessionId: string) => api.deleteSession(sessionId),
     onSuccess: (_result, sessionId) => {
       qc.setQueryData<SessionSummary[]>(['sessions'], (old) =>
-        old?.filter((s) => s.session_id !== sessionId),
+        old?.filter((s) => s.sessionId !== sessionId),
       );
       qc.removeQueries({ queryKey: ['session', sessionId] });
       void qc.invalidateQueries({ queryKey: ['sessions'] });
@@ -31,15 +31,12 @@ export function useDeleteSession() {
   });
 }
 
-export function useClearSessions() {
+/** Import a debug zip; refreshes the session list on success. */
+export function useImportZip() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: () => api.clearSessions(),
-    onSuccess: (result) => {
-      if (result.failed.length === 0) {
-        qc.setQueryData<SessionSummary[]>(['sessions'], []);
-        qc.removeQueries({ queryKey: ['session'] });
-      }
+    mutationFn: (file: File) => api.importZip(file),
+    onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ['sessions'] });
     },
   });

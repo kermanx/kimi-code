@@ -21,11 +21,11 @@ import {
   truncateToWidth,
   visibleWidth,
   type Focusable,
-} from '@earendil-works/pi-tui';
+} from '@moonshot-ai/pi-tui';
 import type { BackgroundTaskInfo, BackgroundTaskStatus } from '@moonshot-ai/kimi-code-sdk';
-import chalk from 'chalk';
 
-import type { ColorPalette } from '@/tui/theme/colors';
+import { SELECT_POINTER } from '@/tui/constant/symbols';
+import { currentTheme } from '#/tui/theme';
 import { printableChar } from '@/tui/utils/printable-key';
 
 const ELLIPSIS = '…';
@@ -39,7 +39,6 @@ export interface TasksBrowserProps {
   readonly tailOutput: string | undefined;
   readonly tailLoading: boolean;
   readonly flashMessage: string | undefined;
-  readonly colors: ColorPalette;
   readonly onSelect: (taskId: string) => void;
   readonly onToggleFilter: () => void;
   readonly onRefresh: () => void;
@@ -54,9 +53,9 @@ export interface TasksBrowserProps {
 
 const STATUS_LABEL: Record<BackgroundTaskStatus, string> = {
   running: 'running',
-  awaiting_approval: 'awaiting',
   completed: 'completed',
   failed: 'failed',
+  timed_out: 'timed out',
   killed: 'killed',
   lost: 'lost',
 };
@@ -73,24 +72,27 @@ const LIST_COL_MIN = 28;
 const LIST_COL_MAX = 44;
 const LIST_COL_RATIO = 0.32;
 
-function statusColor(colors: ColorPalette, status: BackgroundTaskStatus): string {
+function statusColor(status: BackgroundTaskStatus): 'success' | 'textMuted' | 'error' {
   switch (status) {
     case 'running':
-      return colors.success;
-    case 'awaiting_approval':
-      return colors.warning;
+      return 'success';
     case 'completed':
-      return colors.textMuted;
+      return 'textMuted';
     case 'failed':
+    case 'timed_out':
     case 'killed':
     case 'lost':
-      return colors.error;
+      return 'error';
   }
 }
 
 function isTerminal(status: BackgroundTaskStatus): boolean {
   return (
-    status === 'completed' || status === 'failed' || status === 'killed' || status === 'lost'
+    status === 'completed' ||
+    status === 'failed' ||
+    status === 'timed_out' ||
+    status === 'killed' ||
+    status === 'lost'
   );
 }
 
@@ -128,8 +130,13 @@ function visibleTasks(
   tasks: readonly BackgroundTaskInfo[],
   filter: TasksFilter,
 ): BackgroundTaskInfo[] {
-  if (filter === 'all') return [...tasks];
-  return tasks.filter((t) => !isTerminal(t.status));
+  // The /tasks panel is for background task management. Foreground tasks
+  // (detached === false) are shown in the main transcript instead, and only
+  // appear here after being detached via Ctrl+B. `detached !== false` keeps
+  // reconcile ghosts whose `detached` field may be undefined.
+  const backgroundOnly = tasks.filter((t) => t.detached !== false);
+  if (filter === 'all') return [...backgroundOnly];
+  return backgroundOnly.filter((t) => !isTerminal(t.status));
 }
 
 function compareTasks(a: BackgroundTaskInfo, b: BackgroundTaskInfo): number {
@@ -142,25 +149,22 @@ function compareTasks(a: BackgroundTaskInfo, b: BackgroundTaskInfo): number {
 
 interface StatusCounts {
   running: number;
-  awaiting: number;
   completed: number;
   terminalFailed: number;
 }
 
 function countByStatus(tasks: readonly BackgroundTaskInfo[]): StatusCounts {
-  const counts: StatusCounts = { running: 0, awaiting: 0, completed: 0, terminalFailed: 0 };
+  const counts: StatusCounts = { running: 0, completed: 0, terminalFailed: 0 };
   for (const t of tasks) {
     switch (t.status) {
       case 'running':
         counts.running += 1;
         break;
-      case 'awaiting_approval':
-        counts.awaiting += 1;
-        break;
       case 'completed':
         counts.completed += 1;
         break;
       case 'failed':
+      case 'timed_out':
       case 'killed':
       case 'lost':
         counts.terminalFailed += 1;
@@ -329,39 +333,40 @@ export class TasksBrowserApp extends Container implements Focusable {
   // ── header / footer ──────────────────────────────────────────────────
 
   private renderHeader(width: number): string {
-    const colors = this.props.colors;
-    const title = chalk.hex(colors.primary).bold(' TASK BROWSER ');
-    const filterText = chalk.hex(colors.textMuted)(
+    const title = currentTheme.boldFg('primary', ' TASK BROWSER ');
+    const filterText = currentTheme.fg(
+      'textMuted',
       ` filter=${this.props.filter === 'all' ? 'ALL' : 'ACTIVE'} `,
     );
-    const counts = countByStatus(this.props.tasks);
+    // Count only the tasks actually listed (background tasks after the
+    // foreground-task filter), so a foreground-only session doesn't read
+    // "1 running / 1 total" above an empty list.
+    const visible = visibleTasks(this.props.tasks, this.props.filter);
+    const counts = countByStatus(visible);
     const countSegments: string[] = [];
     if (counts.running > 0)
-      countSegments.push(chalk.hex(colors.success)(` ${String(counts.running)} running `));
-    if (counts.awaiting > 0)
-      countSegments.push(chalk.hex(colors.warning)(` ${String(counts.awaiting)} awaiting `));
+      countSegments.push(currentTheme.fg('success', ` ${String(counts.running)} running `));
     if (counts.completed > 0)
-      countSegments.push(chalk.hex(colors.textDim)(` ${String(counts.completed)} completed `));
+      countSegments.push(currentTheme.fg('textDim', ` ${String(counts.completed)} completed `));
     if (counts.terminalFailed > 0)
       countSegments.push(
-        chalk.hex(colors.error)(` ${String(counts.terminalFailed)} interrupted `),
+        currentTheme.fg('error', ` ${String(counts.terminalFailed)} interrupted `),
       );
-    const totals = chalk.hex(colors.textMuted)(` ${String(this.props.tasks.length)} total `);
+    const totals = currentTheme.fg('textMuted', ` ${String(visible.length)} total `);
 
     const composed = title + filterText + countSegments.join('') + totals;
     return fitExactly(composed, width);
   }
 
   private renderFooter(width: number): string {
-    const colors = this.props.colors;
-    const key = (text: string): string => chalk.hex(colors.primary).bold(text);
-    const dim = (text: string): string => chalk.hex(colors.textMuted)(text);
+    const key = (text: string): string => currentTheme.boldFg('primary', text);
+    const dim = (text: string): string => currentTheme.fg('textMuted', text);
 
     if (this.pendingStopTaskId !== undefined) {
-      const warn = (text: string): string => chalk.hex(colors.warning).bold(text);
+      const warn = (text: string): string => currentTheme.boldFg('warning', text);
       const line =
-        ` ${warn('Stop')} ${chalk.hex(colors.text)(this.pendingStopTaskId)}? ` +
-        `${key('Y')} ${dim('confirm')}  ${key('N')} ${dim('cancel')} `;
+        ` ${warn('Stop')} ${currentTheme.fg('text', this.pendingStopTaskId)}? ` +
+        `${key('Y')} ${dim('confirm')}  ${key('N')}${dim('/')}${key('esc')} ${dim('cancel')} `;
       return fitExactly(line, width);
     }
 
@@ -371,12 +376,12 @@ export class TasksBrowserApp extends Container implements Focusable {
       `${key('S')} ${dim('stop')}`,
       `${key('R')} ${dim('refresh')}`,
       `${key('Tab')} ${dim('filter')}`,
-      `${key('Q/Esc')} ${dim('exit')} `,
+      `${key('Q/Esc')} ${dim('cancel')} `,
     ];
     const left = parts.join('  ');
     const flash = this.props.flashMessage;
     if (flash !== undefined && flash.length > 0) {
-      const flashStyled = chalk.hex(colors.warning)(` ${flash} `);
+      const flashStyled = currentTheme.fg('warning', ` ${flash} `);
       const total = visibleWidth(left) + visibleWidth(flashStyled);
       if (total <= width) {
         return left + ' '.repeat(width - total) + flashStyled;
@@ -403,29 +408,28 @@ export class TasksBrowserApp extends Container implements Focusable {
       for (let i = 0; i < height; i++) out.push(' '.repeat(width));
       return out;
     }
-    const stroke = this.props.colors.primary;
     const innerWidth = width - 2;
     const innerHeight = height - 2;
 
-    const titleStyled = chalk.hex(this.props.colors.textStrong).bold(title);
+    const titleStyled = currentTheme.boldFg('textStrong', title);
     const titleWidth = visibleWidth(titleStyled);
     const titleSegment = `─ ${titleStyled} `;
     const titleSegmentWidth = visibleWidth(titleSegment);
     const remainingDashes = Math.max(0, innerWidth - titleSegmentWidth);
     const topMid =
       titleWidth > 0 && titleSegmentWidth <= innerWidth
-        ? chalk.hex(stroke)('─ ') +
+        ? currentTheme.fg('primary', '─ ') +
           titleStyled +
           ' ' +
-          chalk.hex(stroke)('─'.repeat(remainingDashes))
-        : chalk.hex(stroke)('─'.repeat(innerWidth));
-    const top = chalk.hex(stroke)('┌') + topMid + chalk.hex(stroke)('┐');
-    const bottom = chalk.hex(stroke)('└' + '─'.repeat(innerWidth) + '┘');
+          currentTheme.fg('primary', '─'.repeat(remainingDashes))
+        : currentTheme.fg('primary', '─'.repeat(innerWidth));
+    const top = currentTheme.fg('primary', '┌') + topMid + currentTheme.fg('primary', '┐');
+    const bottom = currentTheme.fg('primary', '└' + '─'.repeat(innerWidth) + '┘');
 
     const lines: string[] = [top];
     for (let i = 0; i < innerHeight; i++) {
       const inner = content[i] ?? '';
-      lines.push(chalk.hex(stroke)('│') + fitExactly(inner, innerWidth) + chalk.hex(stroke)('│'));
+      lines.push(currentTheme.fg('primary', '│') + fitExactly(inner, innerWidth) + currentTheme.fg('primary', '│'));
     }
     lines.push(bottom);
     return lines;
@@ -442,7 +446,7 @@ export class TasksBrowserApp extends Container implements Focusable {
         this.props.filter === 'active'
           ? 'No active tasks. Tab = show all.'
           : 'No background tasks in this session.';
-      const lines: string[] = [chalk.hex(this.props.colors.textMuted)(empty)];
+      const lines: string[] = [currentTheme.fg('textMuted', empty)];
       while (lines.length < innerHeight) lines.push('');
       return this.renderFrame(title, lines, width, height);
     }
@@ -463,20 +467,23 @@ export class TasksBrowserApp extends Container implements Focusable {
   }
 
   private renderListRow(task: BackgroundTaskInfo, selected: boolean, innerWidth: number): string {
-    const colors = this.props.colors;
-    const pointer = selected ? '> ' : '  ';
-    const pointerStyled = chalk.hex(selected ? colors.primary : colors.textDim)(pointer);
+    const pointer = selected ? `${SELECT_POINTER} ` : '  ';
+    const pointerStyled = currentTheme.fg(selected ? 'primary' : 'textDim', pointer);
 
-    const idColor = selected ? colors.primary : task.taskId.startsWith('agent-')
-      ? colors.success
-      : colors.accent;
+    const idColor = selected
+      ? 'primary'
+      : task.kind === 'agent'
+        ? 'success'
+        : task.kind === 'question'
+          ? 'warning'
+          : 'accent';
     const idText = selected
-      ? chalk.hex(idColor).bold(task.taskId)
-      : chalk.hex(idColor)(task.taskId);
+      ? currentTheme.boldFg(idColor, task.taskId)
+      : currentTheme.fg(idColor, task.taskId);
     const idPad = ' '.repeat(Math.max(0, 17 - task.taskId.length));
 
     const status = STATUS_LABEL[task.status];
-    const statusBadge = chalk.hex(statusColor(colors, task.status))(status);
+    const statusBadge = currentTheme.fg(statusColor(task.status), status);
 
     const prefix = `${pointerStyled}${idText}${idPad} ${statusBadge}`;
     const prefixWidth = visibleWidth(prefix);
@@ -484,9 +491,11 @@ export class TasksBrowserApp extends Container implements Focusable {
     if (descBudget < 4) return fitExactly(prefix, innerWidth);
 
     const description =
-      singleLine(task.description) || singleLine(task.command) || '(no description)';
+      singleLine(task.description) ||
+      (task.kind === 'process' ? singleLine(task.command) : '') ||
+      '(no description)';
     const desc = truncateToWidth(description, descBudget, ELLIPSIS);
-    return fitExactly(`${prefix} ${chalk.hex(colors.text)(desc)}`, innerWidth);
+    return fitExactly(`${prefix} ${currentTheme.fg('text', desc)}`, innerWidth);
   }
 
   private adjustScroll(visibleRows: number): void {
@@ -518,60 +527,63 @@ export class TasksBrowserApp extends Container implements Focusable {
   }
 
   private renderDetailFrame(width: number, height: number): string[] {
-    const colors = this.props.colors;
     const innerHeight = Math.max(0, height - 2);
     const task = this.sortedVisible[this.selectedIndex];
     if (task === undefined) {
-      const empty = chalk.hex(colors.textMuted)('Select a task from the list.');
+      const empty = currentTheme.fg('textMuted', 'Select a task from the list.');
       const lines: string[] = [empty];
       while (lines.length < innerHeight) lines.push('');
       return this.renderFrame('Detail', lines, width, height);
     }
 
-    const label = (text: string): string => chalk.hex(colors.textMuted)(text.padEnd(14));
-    const value = (text: string): string => chalk.hex(colors.text)(text);
+    const label = (text: string): string => currentTheme.fg('textMuted', text.padEnd(14));
+    const value = (text: string): string => currentTheme.fg('text', text);
 
     const lines: string[] = [
       `${label('Task ID:')}${value(task.taskId)}`,
-      `${label('Status:')}${chalk.hex(statusColor(colors, task.status))(STATUS_LABEL[task.status])}`,
+      `${label('Status:')}${currentTheme.fg(statusColor(task.status), STATUS_LABEL[task.status])}`,
       `${label('Description:')}${value(singleLine(task.description) || '—')}`,
     ];
-    if (task.command && task.command !== task.description) {
+    if (task.kind === 'process' && task.command && task.command !== task.description) {
       lines.push(`${label('Command:')}${value(singleLine(task.command))}`);
     }
+    if (task.kind === 'agent' && task.agentId !== undefined) {
+      lines.push(`${label('Agent ID:')}${value(task.agentId)}`);
+    }
+    if (task.kind === 'agent' && task.subagentType !== undefined) {
+      lines.push(`${label('Agent type:')}${value(task.subagentType)}`);
+    }
+    if (task.kind === 'question') {
+      lines.push(`${label('Questions:')}${currentTheme.fg('textMuted', String(task.questionCount))}`);
+      if (task.toolCallId !== undefined) {
+        lines.push(`${label('Tool call:')}${currentTheme.fg('textMuted', task.toolCallId)}`);
+      }
+    }
     const timing =
-      task.status === 'running' || task.status === 'awaiting_approval'
+      task.status === 'running'
         ? `running ${formatRelativeTime(task.startedAt)}`
         : task.endedAt !== null && task.endedAt !== undefined
           ? `finished ${formatRelativeTime(task.endedAt)}`
           : '';
-    if (timing.length > 0) lines.push(`${label('Time:')}${chalk.hex(colors.textMuted)(timing)}`);
-    if (task.pid > 0) lines.push(`${label('Pid:')}${chalk.hex(colors.textMuted)(String(task.pid))}`);
-    if (task.exitCode !== null && task.exitCode !== undefined) {
-      lines.push(`${label('Exit code:')}${chalk.hex(colors.textMuted)(String(task.exitCode))}`);
+    if (timing.length > 0) lines.push(`${label('Time:')}${currentTheme.fg('textMuted', timing)}`);
+    if (task.kind === 'process' && task.pid > 0) {
+      lines.push(`${label('Pid:')}${currentTheme.fg('textMuted', String(task.pid))}`);
+    }
+    if (task.kind === 'process' && task.exitCode !== null) {
+      lines.push(`${label('Exit code:')}${currentTheme.fg('textMuted', String(task.exitCode))}`);
     }
     if (task.stopReason !== undefined && task.stopReason.length > 0) {
-      lines.push(`${label('Stop reason:')}${chalk.hex(colors.textMuted)(task.stopReason)}`);
+      lines.push(`${label('Reason:')}${currentTheme.fg('textMuted', task.stopReason)}`);
     }
-    if (task.timedOut === true) {
-      lines.push(`${label('Timed out:')}${chalk.hex(colors.warning)('yes')}`);
-    }
-    if (task.approvalReason !== undefined && task.approvalReason.length > 0) {
-      lines.push(
-        `${label('Awaiting:')}${chalk.hex(colors.warning)(singleLine(task.approvalReason))}`,
-      );
-    }
-
     while (lines.length < innerHeight) lines.push('');
     return this.renderFrame('Detail', lines, width, height);
   }
 
   private renderPreviewFrame(width: number, height: number): string[] {
-    const colors = this.props.colors;
     const innerHeight = Math.max(0, height - 2);
     const task = this.sortedVisible[this.selectedIndex];
     if (task === undefined) {
-      const lines: string[] = [chalk.hex(colors.textMuted)('No task selected.')];
+      const lines: string[] = [currentTheme.fg('textMuted', 'No task selected.')];
       while (lines.length < innerHeight) lines.push('');
       return this.renderFrame('Preview Output', lines, width, height);
     }
@@ -584,7 +596,7 @@ export class TasksBrowserApp extends Container implements Focusable {
 
     const rawLines = body.split('\n');
     const tailLines = rawLines.slice(-innerHeight);
-    const styled = tailLines.map((line) => chalk.hex(colors.textDim)(line));
+    const styled = tailLines.map((line) => currentTheme.fg('textDim', line));
     while (styled.length < innerHeight) styled.push('');
     return this.renderFrame('Preview Output', styled, width, height);
   }
@@ -593,7 +605,8 @@ export class TasksBrowserApp extends Container implements Focusable {
 
   private renderTooSmall(width: number, rows: number): string[] {
     const lines: string[] = [];
-    const msg = chalk.hex(this.props.colors.error)(
+    const msg = currentTheme.fg(
+      'error',
       `Terminal too small (need ≥ ${String(MIN_WIDTH)} × ${String(MIN_HEIGHT)})`,
     );
     lines.push(fitExactly(msg, width));

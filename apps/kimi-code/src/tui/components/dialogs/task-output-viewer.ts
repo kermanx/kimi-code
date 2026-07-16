@@ -17,11 +17,10 @@ import {
   truncateToWidth,
   visibleWidth,
   type Focusable,
-} from '@earendil-works/pi-tui';
+} from '@moonshot-ai/pi-tui';
 import type { BackgroundTaskInfo, BackgroundTaskStatus } from '@moonshot-ai/kimi-code-sdk';
-import chalk from 'chalk';
 
-import type { ColorPalette } from '@/tui/theme/colors';
+import { currentTheme } from '#/tui/theme';
 import { printableChar } from '@/tui/utils/printable-key';
 
 const ELLIPSIS = '…';
@@ -30,31 +29,29 @@ export interface TaskOutputViewerProps {
   readonly taskId: string;
   readonly info: BackgroundTaskInfo | undefined;
   readonly output: string;
-  readonly colors: ColorPalette;
   readonly onClose: () => void;
 }
 
 const STATUS_LABEL: Record<BackgroundTaskStatus, string> = {
   running: 'running',
-  awaiting_approval: 'awaiting',
   completed: 'completed',
   failed: 'failed',
+  timed_out: 'timed out',
   killed: 'killed',
   lost: 'lost',
 };
 
-function statusColor(colors: ColorPalette, status: BackgroundTaskStatus): string {
+function statusColor(status: BackgroundTaskStatus): 'success' | 'textMuted' | 'error' {
   switch (status) {
     case 'running':
-      return colors.success;
-    case 'awaiting_approval':
-      return colors.warning;
+      return 'success';
     case 'completed':
-      return colors.textMuted;
+      return 'textMuted';
     case 'failed':
+    case 'timed_out':
     case 'killed':
     case 'lost':
-      return colors.error;
+      return 'error';
   }
 }
 
@@ -128,11 +125,20 @@ export class TaskOutputViewer extends Container implements Focusable {
       this.scrollBy(1);
       return;
     }
-    if (matchesKey(data, Key.pageUp) || k === ' ' || data === '\u0002' /* C-b */) {
+    if (
+      matchesKey(data, Key.pageUp) ||
+      matchesKey(data, Key.ctrl('u')) ||
+      k === ' ' ||
+      data === '\u0002' /* C-b */
+    ) {
       this.scrollBy(-Math.max(1, visible - 1));
       return;
     }
-    if (matchesKey(data, Key.pageDown) || data === '\u0006' /* C-f */) {
+    if (
+      matchesKey(data, Key.pageDown) ||
+      matchesKey(data, Key.ctrl('d')) ||
+      data === '\u0006' /* C-f */
+    ) {
       this.scrollBy(Math.max(1, visible - 1));
       return;
     }
@@ -184,18 +190,17 @@ export class TaskOutputViewer extends Container implements Focusable {
   }
 
   private renderHeader(width: number): string {
-    const colors = this.props.colors;
-    const title = chalk.hex(colors.primary).bold(' Task output ');
-    const id = chalk.hex(colors.text).bold(this.props.taskId);
+    const title = currentTheme.boldFg('primary', ' Task output ');
+    const id = currentTheme.boldFg('text', this.props.taskId);
     const info = this.props.info;
     const segments: string[] = [];
     if (info !== undefined) {
-      segments.push(chalk.hex(statusColor(colors, info.status))(STATUS_LABEL[info.status]));
-      if (info.exitCode !== null && info.exitCode !== undefined) {
-        segments.push(chalk.hex(colors.textMuted)(`exit ${String(info.exitCode)}`));
+      segments.push(currentTheme.fg(statusColor(info.status), STATUS_LABEL[info.status]));
+      if (info.kind === 'process' && info.exitCode !== null) {
+        segments.push(currentTheme.fg('textMuted', `exit ${String(info.exitCode)}`));
       }
       if (info.description && info.description.length > 0) {
-        segments.push(chalk.hex(colors.textMuted)(info.description));
+        segments.push(currentTheme.fg('textMuted', info.description));
       }
     }
     const composed = title + id + (segments.length > 0 ? '  ' + segments.join('  ') : '');
@@ -203,9 +208,6 @@ export class TaskOutputViewer extends Container implements Focusable {
   }
 
   private renderBody(width: number, bodyHeight: number): string[] {
-    const colors = this.props.colors;
-    const stroke = colors.primary;
-
     // Reserve 1 col for left/right border each, 1 col for left padding.
     const innerWidth = Math.max(1, width - 4);
 
@@ -215,24 +217,23 @@ export class TaskOutputViewer extends Container implements Focusable {
     if (this.scrollTop < 0) this.scrollTop = 0;
 
     const viewRows = bodyHeight - 2; // inside top + bottom border
-    const top = chalk.hex(stroke)('┌' + '─'.repeat(Math.max(0, width - 2)) + '┐');
-    const bottom = chalk.hex(stroke)('└' + '─'.repeat(Math.max(0, width - 2)) + '┘');
+    const top = currentTheme.fg('primary', '┌' + '─'.repeat(Math.max(0, width - 2)) + '┐');
+    const bottom = currentTheme.fg('primary', '└' + '─'.repeat(Math.max(0, width - 2)) + '┘');
 
     const out: string[] = [top];
     for (let i = 0; i < viewRows; i++) {
       const lineIndex = this.scrollTop + i;
       const raw = this.lines[lineIndex] ?? '';
-      const inner = fitExactly(chalk.hex(colors.text)(raw), innerWidth);
-      out.push(chalk.hex(stroke)('│ ') + inner + chalk.hex(stroke)(' │'));
+      const inner = fitExactly(currentTheme.fg('text', raw), innerWidth);
+      out.push(currentTheme.fg('primary', '│ ') + inner + currentTheme.fg('primary', ' │'));
     }
     out.push(bottom);
     return out;
   }
 
   private renderFooter(width: number, bodyHeight: number): string {
-    const colors = this.props.colors;
-    const key = (text: string): string => chalk.hex(colors.primary).bold(text);
-    const dim = (text: string): string => chalk.hex(colors.textMuted)(text);
+    const key = (text: string): string => currentTheme.boldFg('primary', text);
+    const dim = (text: string): string => currentTheme.fg('textMuted', text);
 
     const total = this.lines.length;
     const viewRows = Math.max(1, bodyHeight - 2);
@@ -242,14 +243,15 @@ export class TaskOutputViewer extends Container implements Focusable {
     const lineFrom = this.scrollTop + 1;
     const lineTo = Math.min(total, this.scrollTop + viewRows);
 
-    const position = chalk.hex(colors.textMuted)(
+    const position = currentTheme.fg(
+      'textMuted',
       ` ${String(lineFrom)}-${String(lineTo)} / ${String(total)} (${String(percent)}%) `,
     );
     const keys =
       `${key('↑↓')} ${dim('line')}  ` +
-      `${key('PgUp/PgDn')} ${dim('page')}  ` +
+      `${key('PgUp/PgDn/Ctrl+U/D')} ${dim('page')}  ` +
       `${key('g/G')} ${dim('top/bot')}  ` +
-      `${key('Q/Esc')} ${dim('back')}`;
+      `${key('Q/Esc')} ${dim('cancel')}`;
     const left = ` ${keys}`;
     const leftW = visibleWidth(left);
     const rightW = visibleWidth(position);

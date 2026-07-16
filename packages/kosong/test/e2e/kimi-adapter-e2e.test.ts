@@ -131,7 +131,8 @@ describe('e2e: kimi adapter', () => {
             {
               type: 'function',
               id: 'call_weather',
-              function: { name: 'lookup_weather', arguments: '{"city":"Shanghai"}' },
+              name: 'lookup_weather',
+              arguments: '{"city":"Shanghai"}',
             } satisfies ToolCall,
           ],
         },
@@ -148,7 +149,6 @@ describe('e2e: kimi adapter', () => {
         model: 'kimi-k2-turbo-preview',
         stream: true,
         stream_options: { include_usage: true },
-        reasoning_effort: 'high',
         thinking: { type: 'enabled' },
         messages: [
           { role: 'system', content: 'You are helpful.' },
@@ -185,7 +185,8 @@ describe('e2e: kimi adapter', () => {
       expect(result.parts[2]).toMatchObject({
         type: 'function',
         id: 'call_weather',
-        function: { name: 'lookup_weather', arguments: '{"city":"' },
+        name: 'lookup_weather',
+        arguments: '{"city":"',
       });
       expect(result.parts[2]).toHaveProperty('_streamIndex', 0);
       expect(result.parts[3]).toMatchObject({
@@ -227,7 +228,6 @@ describe('e2e: kimi adapter', () => {
         model: 'kimi-k2-turbo-preview',
         stream: true,
         stream_options: { include_usage: true },
-        reasoning_effort: 'high',
       });
       expect(harness.requests.length).toBeGreaterThanOrEqual(1);
     });

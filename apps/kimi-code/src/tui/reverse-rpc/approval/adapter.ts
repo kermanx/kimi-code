@@ -1,6 +1,7 @@
 import type { ApprovalRequest, ApprovalResponse, ToolInputDisplay } from '@moonshot-ai/kimi-code-sdk';
 
 import type { ApprovalPanelResponse } from '#/tui/components/dialogs/approval-panel';
+import { goalStartOptions } from '#/tui/components/dialogs/goal-start-permission-prompt';
 import type { ApprovalPanelChoice, ApprovalPanelData, DisplayBlock } from '#/tui/reverse-rpc/types';
 
 const DEFAULT_APPROVAL_CHOICES: ApprovalPanelChoice[] = [
@@ -176,6 +177,8 @@ function describeApproval(display: ToolInputDisplay, action: string): string {
   switch (display.kind) {
     case 'plan_review':
       return '';
+    case 'goal_start':
+      return 'Start a goal?';
     case 'generic':
       if (typeof display.detail === 'string' && display.detail.length > 0) {
         return display.detail;
@@ -199,7 +202,7 @@ function describeApproval(display: ToolInputDisplay, action: string): string {
       return `search: ${display.query ?? ''}`.trim();
     case 'todo_list':
       return `update todo list (${String(display.items?.length ?? 0)} items)`;
-    case 'background_task':
+    case 'task':
       return `${display.status ?? 'background'} task ${display.task_id ?? ''}: ${
         display.description ?? ''
       }`.trim();
@@ -251,15 +254,32 @@ function adaptDisplay(display: ToolInputDisplay): DisplayBlock[] {
           new_text: display.after ?? '',
         },
       ];
-    case 'file_io':
+    case 'file_io': {
+      const path = display.path ?? '';
+      // Write attaches the full file content — render it as a syntax-
+      // highlighted code block so the approval panel can preview (and
+      // ctrl+e expand) what is about to land on disk.
+      if (display.operation === 'write' && typeof display.content === 'string') {
+        return [{ type: 'file_content', path, content: display.content }];
+      }
+      // Edit attaches the old_string/new_string hunk as before/after — render
+      // it as a diff block so ctrl+e expansion works on the change.
+      if (
+        display.operation === 'edit' &&
+        typeof display.before === 'string' &&
+        typeof display.after === 'string'
+      ) {
+        return [{ type: 'diff', path, old_text: display.before, new_text: display.after }];
+      }
       return [
         {
           type: 'file_op',
           operation: display.operation,
-          path: display.path ?? '',
+          path,
           detail: display.detail,
         },
       ];
+    }
     case 'url_fetch':
       return [
         {
@@ -303,11 +323,18 @@ function adaptDisplay(display: ToolInputDisplay): DisplayBlock[] {
       ];
     case 'plan_review':
       return [];
+    case 'goal_start': {
+      const lines = [`Start goal: ${display.objective}`];
+      if (typeof display.completionCriterion === 'string' && display.completionCriterion.length > 0) {
+        lines.push(`Done when: ${display.completionCriterion}`);
+      }
+      return [{ type: 'brief', text: lines.join('\n') }];
+    }
     case 'generic':
       return [];
     case 'todo_list':
       return [];
-    case 'background_task':
+    case 'task':
       return [];
     default:
       return [];
@@ -318,8 +345,34 @@ function adaptChoices(toolName: string, display: ToolInputDisplay): ApprovalPane
   if (toolName === 'ExitPlanMode' || display.kind === 'plan_review') {
     return adaptPlanReviewChoices(display);
   }
+  if (display.kind === 'goal_start') {
+    return adaptGoalStartChoices(display);
+  }
 
   return DEFAULT_APPROVAL_CHOICES.map((choice) => cloneChoice(choice));
+}
+
+function adaptGoalStartChoices(
+  display: Extract<ToolInputDisplay, { kind: 'goal_start' }>,
+): ApprovalPanelChoice[] {
+  // Reuse the exact options the /goal start menu shows. Each mode option starts
+  // the goal under that permission mode (the policy reads selected_label); "Do
+  // not start" declines so no goal is created.
+  return goalStartOptions(display.mode).map((option) =>
+    option.value === 'cancel'
+      ? {
+          label: option.label,
+          response: 'cancelled',
+          selected_label: 'cancel',
+          description: option.description,
+        }
+      : {
+          label: option.label,
+          response: 'approved',
+          selected_label: option.value,
+          description: option.description,
+        },
+  );
 }
 
 function adaptPlanReviewChoices(display: ToolInputDisplay): ApprovalPanelChoice[] {

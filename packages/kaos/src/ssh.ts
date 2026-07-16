@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import { posix } from 'node:path';
+import { isAbsolute, join, normalize, resolve } from 'pathe';
 import type { Readable, Writable } from 'node:stream';
 
 import * as ssh2 from 'ssh2';
@@ -12,6 +12,7 @@ import type {
   Stats as SFTPStats,
 } from 'ssh2';
 
+import type { Environment } from './environment';
 import { KaosError, KaosFileExistsError, KaosValueError } from './errors';
 import { BufferedReadable, decodeTextWithErrors, globPatternToRegex } from './internal';
 import type { Kaos } from './kaos';
@@ -221,6 +222,7 @@ export class SSHProcess implements KaosProcess {
   private _exitCode: number | null = null;
   private readonly _exitPromise: Promise<number>;
   private readonly _channel: ClientChannel;
+  private _disposed = false;
 
   constructor(channel: ClientChannel) {
     this._channel = channel;
@@ -259,6 +261,14 @@ export class SSHProcess implements KaosProcess {
     const sshSignal = rawSignal.startsWith('SIG') ? rawSignal.slice(3) : rawSignal;
     this._channel.signal(sshSignal);
     return Promise.resolve();
+  }
+
+  dispose(): void {
+    if (this._disposed) return;
+    this._disposed = true;
+    this.stdin.destroy();
+    this.stdout.destroy();
+    this.stderr.destroy();
   }
 }
 
@@ -429,17 +439,41 @@ export class SSHKaos implements Kaos {
   private _sftp: SFTPWrapper;
   private _home: string;
   private _cwd: string;
+  private readonly _envLayers: readonly Record<string, string>[];
 
-  private constructor(client: Client, sftp: SFTPWrapper, home: string, cwd: string) {
+  // Stub: real wiring (probing the remote host via `uname` / `$SHELL` over the
+  // SSH transport) is deferred.
+  get osEnv(): Environment {
+    throw new KaosError(
+      'SSHKaos.osEnv is not yet wired — remote environment probing is not implemented.',
+    );
+  }
+
+  private constructor(
+    client: Client,
+    sftp: SFTPWrapper,
+    home: string,
+    cwd: string,
+    envLayers: readonly Record<string, string>[] = [],
+  ) {
     this._client = client;
     this._sftp = sftp;
     this._home = home;
     this._cwd = cwd;
+    this._envLayers = envLayers;
+  }
+
+  withCwd(cwd: string): SSHKaos {
+    return new SSHKaos(this._client, this._sftp, this._home, cwd, this._envLayers);
+  }
+
+  withEnv(env: Record<string, string>): SSHKaos {
+    return new SSHKaos(this._client, this._sftp, this._home, this._cwd, [...this._envLayers, env]);
   }
 
   private _resolvePath(path: string): string {
-    if (posix.isAbsolute(path)) return path;
-    return posix.join(this._cwd, path);
+    if (isAbsolute(path)) return path;
+    return join(this._cwd, path);
   }
 
   /**
@@ -515,7 +549,7 @@ export class SSHKaos implements Kaos {
   }
 
   normpath(path: string): string {
-    return posix.normalize(path);
+    return normalize(path);
   }
 
   gethome(): string {
@@ -530,10 +564,10 @@ export class SSHKaos implements Kaos {
 
   async chdir(path: string): Promise<void> {
     let target: string;
-    if (posix.isAbsolute(path)) {
+    if (isAbsolute(path)) {
       target = path;
     } else {
-      target = posix.resolve(this._cwd, path);
+      target = resolve(this._cwd, path);
     }
     // Resolve to the real path via SFTP
     const resolved = await sftpRealpath(this._sftp, target);
@@ -578,7 +612,7 @@ export class SSHKaos implements Kaos {
     const entries = await sftpReaddir(this._sftp, resolved);
     for (const entry of entries) {
       if (entry.filename === '.' || entry.filename === '..') continue;
-      yield posix.join(resolved, entry.filename);
+      yield join(resolved, entry.filename);
     }
   }
 
@@ -637,7 +671,7 @@ export class SSHKaos implements Kaos {
 
       for (const entry of entries) {
         if (entry.filename === '.' || entry.filename === '..') continue;
-        const fullPath = posix.join(basePath, entry.filename);
+        const fullPath = join(basePath, entry.filename);
         if (entry.attrs.isDirectory()) {
           yield* this._globWalk(fullPath, patternParts, caseSensitive);
         } else if (remainingParts.length === 0) {
@@ -659,7 +693,7 @@ export class SSHKaos implements Kaos {
         if (entry.filename === '.' || entry.filename === '..') continue;
         if (!regex.test(entry.filename)) continue;
 
-        const fullPath = posix.join(basePath, entry.filename);
+        const fullPath = join(basePath, entry.filename);
 
         if (remainingParts.length === 0) {
           yield fullPath;
@@ -764,7 +798,7 @@ export class SSHKaos implements Kaos {
     let current = path.startsWith('/') ? '/' : '';
     const lastIndex = parts.length - 1;
     for (const [i, part] of parts.entries()) {
-      current = current ? posix.join(current, part) : part;
+      current = current ? join(current, part) : part;
 
       const isFinal = i === lastIndex;
 
@@ -821,7 +855,7 @@ export class SSHKaos implements Kaos {
         'SSHKaos.exec(): at least one argument (the command to run) is required.',
       );
     }
-    return this._execInternal(args);
+    return this._execInternal(args, this._buildExecEnv());
   }
 
   execWithEnv(args: string[], env?: Record<string, string>): Promise<KaosProcess> {
@@ -830,7 +864,16 @@ export class SSHKaos implements Kaos {
         'SSHKaos.execWithEnv(): at least one argument (the command to run) is required.',
       );
     }
-    return this._execInternal(args, env);
+    return this._execInternal(args, this._buildExecEnv(env));
+  }
+
+  private _buildExecEnv(invocationEnv?: Record<string, string>): Record<string, string> | undefined {
+    if (this._envLayers.length === 0) return invocationEnv;
+    const merged: Record<string, string> = { ...invocationEnv };
+    for (const layer of this._envLayers) {
+      Object.assign(merged, layer);
+    }
+    return merged;
   }
 
   /**

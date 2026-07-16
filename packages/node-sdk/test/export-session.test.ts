@@ -7,14 +7,22 @@ import * as zlib from 'node:zlib';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
+  createKimiHarness,
   KimiError,
-  KimiHarness,
   type SessionSummary,
 } from '#/index';
 import { resolveGlobalLogPath } from '../../agent-core/src/logging/logger';
-import { exportSessionDirectory } from '../../agent-core/src/session/export';
+import {
+  WIRE_PROTOCOL_VERSION,
+  exportSessionDirectory,
+} from '../../agent-core/src/session/export';
 import { recordingTelemetry, type TelemetryRecord } from './telemetry';
 import { TEST_IDENTITY } from './test-identity';
+
+// agent-core/node-sdk normalize paths to forward slashes (pathe). Mirror that
+// in path assertions so they hold on Windows, where node:path produces
+// backslashes.
+const toPosix = (p: string): string => p.replaceAll('\\', '/');
 
 const tempDirs: string[] = [];
 
@@ -126,7 +134,7 @@ describe('exportSessionDirectory', () => {
       }),
     });
 
-    expect(result.zipPath).toBe(outputPath);
+    expect(result.zipPath).toBe(toPosix(outputPath));
     expect(result.sessionDir).toBe(sessionDir);
     expect(result.entries).toEqual([
       'manifest.json',
@@ -136,7 +144,7 @@ describe('exportSessionDirectory', () => {
     ]);
     expect(result.manifest).toMatchObject({
       sessionId: sid,
-      wireProtocolVersion: '1.0',
+      wireProtocolVersion: WIRE_PROTOCOL_VERSION,
       sessionFirstActivity: '2026-04-18T10:00:00.000Z',
       sessionLastActivity: '2026-04-18T10:00:03.000Z',
       title: 'Export Test',
@@ -174,7 +182,7 @@ describe('exportSessionDirectory', () => {
     });
 
     const expectedPath = resolve(`${sid}.zip`);
-    expect(result.zipPath).toBe(expectedPath);
+    expect(result.zipPath).toBe(toPosix(expectedPath));
     expect(existsSync(result.zipPath)).toBe(true);
     await rm(expectedPath, { force: true });
   });
@@ -219,7 +227,7 @@ describe('exportSessionDirectory', () => {
       summary: makeSummary({ id: sid, sessionDir, workDir: tmp }),
     });
 
-    expect(result.zipPath).toBe(outputPath);
+    expect(result.zipPath).toBe(toPosix(outputPath));
     expect(existsSync(result.zipPath)).toBe(true);
   });
 
@@ -263,7 +271,7 @@ describe('KimiHarness.exportSession', () => {
     const homeDir = await makeTempDir();
     const workDir = await makeTempDir();
     const records: TelemetryRecord[] = [];
-    const harness = new KimiHarness({
+    const harness = createKimiHarness({
       identity: TEST_IDENTITY,
       homeDir,
       telemetry: recordingTelemetry(records),
@@ -283,7 +291,7 @@ describe('KimiHarness.exportSession', () => {
     const outputPath = join(workDir, 'export.zip');
     const result = await harness.exportSession({ id: session.id, outputPath, version: '1.0.0-test' });
 
-    expect(result.zipPath).toBe(outputPath);
+    expect(result.zipPath).toBe(toPosix(outputPath));
     expect(result.entries).toContain('manifest.json');
     expect(result.entries).toContain('state.json');
     expect(result.entries).toContain('wire.jsonl');
@@ -298,7 +306,7 @@ describe('KimiHarness.exportSession', () => {
 
   it('rejects missing session ids', async () => {
     const homeDir = await makeTempDir();
-    const harness = new KimiHarness({ homeDir, identity: TEST_IDENTITY });
+    const harness = createKimiHarness({ homeDir, identity: TEST_IDENTITY });
 
     const missingExport = harness.exportSession({ id: 'ses_missing', version: '1.0.0-test' });
     await expect(missingExport).rejects.toBeInstanceOf(KimiError);

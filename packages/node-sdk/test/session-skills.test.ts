@@ -1,12 +1,19 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type * as KosongModule from '@moonshot-ai/kosong';
 import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 
-import type { Event, KimiError, SkillActivatedEvent, SkillSummary } from '#/index';
-import type { SDKRpcClient } from '#/rpc';
+import {
+  createKimiHarness,
+  type Event,
+  type KimiError,
+  type SkillActivatedEvent,
+  type SkillSummary,
+} from '#/index';
+import type { SDKRpcClientBase } from '#/rpc';
 
+import { normalizeWorkDir } from '../../agent-core/src/session/store';
 import {
   makeTempDir,
   removeTempDirs,
@@ -52,7 +59,7 @@ vi.mock('@moonshot-ai/kosong', async (importOriginal) => {
   };
 });
 
-const { KimiHarness, Session } = await import('#/index');
+const { Session } = await import('#/index');
 
 const tempDirs: string[] = [];
 
@@ -79,7 +86,7 @@ describe('Session skills', () => {
       '',
       'Review the requested file.',
     ]);
-    const harness = new KimiHarness({ homeDir, identity: TEST_IDENTITY });
+    const harness = createKimiHarness({ homeDir, identity: TEST_IDENTITY });
 
     try {
       const session = await harness.createSession({ id: 'ses_sdk_skill_list', workDir });
@@ -111,7 +118,7 @@ describe('Session skills', () => {
       '',
       'Review the requested file.',
     ]);
-    const harness = new KimiHarness({ homeDir, identity: TEST_IDENTITY });
+    const harness = createKimiHarness({ homeDir, identity: TEST_IDENTITY });
 
     try {
       const session = await harness.createSession({ id: 'ses_sdk_skill_activate', workDir });
@@ -166,6 +173,7 @@ describe('Session skills', () => {
       expect(state['isCustomTitle']).toBe(false);
       expect(state['lastPrompt']).toBe('/review src/app.ts');
 
+      const skillDir = normalizeWorkDir(await realpath(join(workDir, '.kimi-code', 'skills', 'review')));
       await expect(
         waitForAgentWireEvent(
           homeDir,
@@ -178,7 +186,15 @@ describe('Session skills', () => {
         input: [
           {
             type: 'text',
-            text: 'Review the requested file.\n\nARGUMENTS: src/app.ts',
+            text: [
+              'User activated the skill "review". Follow the loaded skill instructions.',
+              '',
+              `<kimi-skill-loaded name="review" trigger="user-slash" source="project" dir="${skillDir}" args="src/app.ts">`,
+              'Review the requested file.',
+              '',
+              'ARGUMENTS: src/app.ts',
+              '</kimi-skill-loaded>',
+            ].join('\n'),
           },
         ],
         origin: {
@@ -192,22 +208,22 @@ describe('Session skills', () => {
     }
   });
 
-  it('uses KIMI_CODE_HOME as the user skill home through the SDK harness', async () => {
+  it('resolves user brand skills from KIMI_CODE_HOME, not the OS home', async () => {
     const homeDir = await makeTempDir(tempDirs, 'kimi-sdk-skills-home-');
     const processHome = await makeTempDir(tempDirs, 'kimi-sdk-skills-process-home-');
     const workDir = await makeTempDir(tempDirs, 'kimi-sdk-skills-work-');
     vi.stubEnv('HOME', processHome);
     vi.stubEnv('KIMI_CODE_HOME', homeDir);
-    await writeUserSkill(processHome, 'sdk-real-home-only', 'SDK real home skill');
-    await writeUserSkill(homeDir, 'sdk-sandbox-only', 'SDK sandbox skill');
-    const harness = new KimiHarness({ identity: TEST_IDENTITY });
+    await writeLegacyUserSkill(processHome, 'sdk-real-home-only', 'SDK real home skill');
+    await writeBrandUserSkill(homeDir, 'sdk-sandbox-only', 'SDK sandbox skill');
+    const harness = createKimiHarness({ identity: TEST_IDENTITY });
 
     try {
       const session = await harness.createSession({ id: 'ses_sdk_skill_env_home', workDir });
       const names = new Set((await session.listSkills()).map((skill) => skill.name));
 
-      expect(names.has('sdk-sandbox-only')).toBe(true);
       expect(names.has('sdk-real-home-only')).toBe(false);
+      expect(names.has('sdk-sandbox-only')).toBe(true);
     } finally {
       await harness.close();
     }
@@ -226,7 +242,7 @@ describe('Session skills', () => {
         closeSession,
         clearSessionHandlers,
         listSkills,
-      } as unknown as SDKRpcClient,
+      } as unknown as SDKRpcClientBase,
     });
 
     await expect(session.activateSkill('   ')).rejects.toMatchObject({
@@ -263,7 +279,7 @@ describe('Session skills', () => {
         closeSession,
         clearSessionHandlers,
         listSkills,
-      } as unknown as SDKRpcClient,
+      } as unknown as SDKRpcClientBase,
     });
 
     await expect(session.close()).rejects.toThrow('flush failed');
@@ -288,8 +304,23 @@ async function writeSkill(workDir: string, name: string, lines: readonly string[
   await writeFile(join(dir, 'SKILL.md'), lines.join('\n'));
 }
 
-async function writeUserSkill(userHomeDir: string, name: string, description: string): Promise<void> {
-  const dir = join(userHomeDir, '.kimi-code', 'skills', name);
+async function writeLegacyUserSkill(
+  userHomeDir: string,
+  name: string,
+  description: string,
+): Promise<void> {
+  await writeSkillFile(join(userHomeDir, '.kimi-code', 'skills', name), name, description);
+}
+
+async function writeBrandUserSkill(
+  brandHomeDir: string,
+  name: string,
+  description: string,
+): Promise<void> {
+  await writeSkillFile(join(brandHomeDir, 'skills', name), name, description);
+}
+
+async function writeSkillFile(dir: string, name: string, description: string): Promise<void> {
   await mkdir(dir, { recursive: true });
   await writeFile(
     join(dir, 'SKILL.md'),

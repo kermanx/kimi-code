@@ -2,6 +2,8 @@ import { expandSkillParameters, skillArgumentNames } from './parser';
 import { discoverSkills, type DiscoverSkillsOptions } from './scanner';
 import type { SkillDefinition, SkillRoot, SkillSource, SkippedSkill } from './types';
 import { isInlineSkillType, normalizeSkillName } from './types';
+import type { SkillRegistry as AgentSkillRegistry } from '../agent/skill/types';
+import { escapeXmlAttr } from '../utils/xml-escape';
 
 const LISTING_DESC_MAX = 250;
 
@@ -21,8 +23,9 @@ export interface SkillRegistryOptions {
   readonly sessionId?: string;
 }
 
-export class SkillRegistry {
+export class SessionSkillRegistry implements AgentSkillRegistry {
   private readonly byName = new Map<string, SkillDefinition>();
+  private readonly byPluginAndName = new Map<string, SkillDefinition>();
   private readonly roots: string[] = [];
   private readonly skipped: SkippedSkill[] = [];
   private readonly discoverImpl: typeof discoverSkills;
@@ -44,6 +47,9 @@ export class SkillRegistry {
       roots,
       onWarning: this.onWarning,
       onSkippedByPolicy: (skill) => this.skipped.push(skill),
+      onDiscoveredSkill: (skill) => {
+        this.indexPluginSkill(skill);
+      },
     } satisfies DiscoverSkillsOptions);
 
     for (const skill of skills) {
@@ -60,19 +66,44 @@ export class SkillRegistry {
     if (options.replace === true || !this.byName.has(key)) {
       this.byName.set(key, skill);
     }
+    this.indexPluginSkill(skill, options);
   }
 
   getSkill(name: string): SkillDefinition | undefined {
     return this.byName.get(normalizeSkillName(name));
   }
 
+  getPluginSkill(pluginId: string, name: string): SkillDefinition | undefined {
+    return this.byPluginAndName.get(pluginSkillKey(pluginId, name));
+  }
+
+  private indexPluginSkill(
+    skill: SkillDefinition,
+    options: { readonly replace?: boolean } = {},
+  ): void {
+    if (skill.plugin === undefined) return;
+    const key = pluginSkillKey(skill.plugin.id, skill.name);
+    if (options.replace === true || !this.byPluginAndName.has(key)) {
+      this.byPluginAndName.set(key, skill);
+    }
+  }
+
   renderSkillPrompt(skill: SkillDefinition, rawArgs: string): string {
     const argumentNames = skillArgumentNames(skill.metadata);
-    return expandSkillParameters(skill.content, rawArgs, {
+    const content = expandSkillParameters(skill.content, rawArgs, {
       skillDir: skill.dir,
       sessionId: this.sessionId,
       argumentNames,
     });
+    const plugin = skill.plugin;
+    if (plugin === undefined) return content;
+    const instructions = plugin.instructions;
+    if (instructions === undefined || instructions.trim().length === 0) return content;
+    return (
+      `<kimi-plugin-instructions plugin="${escapeXmlAttr(plugin.id)}">\n` +
+      `${instructions}\n` +
+      `</kimi-plugin-instructions>\n\n${content}`
+    );
   }
 
   listSkills(): readonly SkillDefinition[] {
@@ -101,12 +132,19 @@ export class SkillRegistry {
 
   getModelSkillListing(): string {
     const lines = ['DISREGARD any earlier skill listings. Current available skills:'];
-    const listing = renderGroupedSkills(this.listInvocableSkills(), formatModelSkill);
+    const listing = renderGroupedSkills(
+      this.listInvocableSkills().filter((skill) => skill.metadata.isSubSkill !== true),
+      formatModelSkill,
+    );
     if (listing.length > 0) {
       lines.push(listing);
     }
     return lines.length === 1 ? '' : lines.join('\n');
   }
+}
+
+function pluginSkillKey(pluginId: string, skillName: string): string {
+  return `${pluginId}\0${normalizeSkillName(skillName)}`;
 }
 
 const SOURCE_GROUPS: ReadonlyArray<{ readonly source: SkillSource; readonly label: string }> = [
@@ -145,6 +183,18 @@ function formatModelSkill(skill: SkillDefinition): readonly string[] {
   return lines;
 }
 
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
 function truncate(value: string, max: number): string {
-  return value.length > max ? value.slice(0, max) : value;
+  if (value.length <= max) return value;
+  // Reserve one code unit for the trailing ellipsis and walk whole grapheme
+  // clusters so we never split a surrogate pair or combining sequence.
+  let length = 0;
+  let result = '';
+  for (const { segment } of graphemeSegmenter.segment(value)) {
+    if (length + segment.length > max - 1) break;
+    result += segment;
+    length += segment.length;
+  }
+  return `${result}…`;
 }

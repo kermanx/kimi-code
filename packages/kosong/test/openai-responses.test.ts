@@ -1,10 +1,16 @@
-import { ChatProviderError } from '#/errors';
+import {
+  APIContextOverflowError,
+  APIProviderRateLimitError,
+  APIStatusError,
+  ChatProviderError,
+} from '#/errors';
 import { generate } from '#/generate';
 import type { ContentPart, Message, StreamedMessagePart, ToolCall } from '#/message';
 import {
   OpenAIResponsesChatProvider,
   OpenAIResponsesStreamedMessage,
 } from '#/providers/openai-responses';
+import type { GenerateOptions } from '#/provider';
 import type { Tool } from '#/tool';
 import { describe, it, expect, vi } from 'vitest';
 
@@ -40,6 +46,7 @@ async function captureRequestBody(
   systemPrompt: string,
   tools: Tool[],
   history: Message[],
+  options?: GenerateOptions,
 ): Promise<Record<string, unknown>> {
   let capturedBody: Record<string, unknown> | undefined;
 
@@ -52,7 +59,7 @@ async function captureRequestBody(
       return Promise.resolve(makeResponsesAPIResponse());
     });
 
-  const stream = await provider.generate(systemPrompt, tools, history);
+  const stream = await provider.generate(systemPrompt, tools, history, options);
   for await (const part of stream) {
     void part;
   }
@@ -91,16 +98,15 @@ const MUL_TOOL: Tool = {
 
 describe('OpenAIResponsesChatProvider', () => {
   describe('message conversion', () => {
-    it('simple user message with system prompt', async () => {
+    it('sends system prompt as top-level instructions', async () => {
       const provider = createProvider();
       const history: Message[] = [
         { role: 'user', content: [{ type: 'text', text: 'Hello!' }], toolCalls: [] },
       ];
       const body = await captureRequestBody(provider, 'You are helpful.', [], history);
 
+      expect(body['instructions']).toBe('You are helpful.');
       expect(body['input']).toEqual([
-        // gpt-4.1 is an OpenAI model -> developer role
-        { role: 'developer', content: 'You are helpful.' },
         {
           content: [{ type: 'input_text', text: 'Hello!' }],
           role: 'user',
@@ -119,6 +125,7 @@ describe('OpenAIResponsesChatProvider', () => {
       ];
       const body = await captureRequestBody(provider, '', [], history);
 
+      expect(body).not.toHaveProperty('instructions');
       expect(body['input']).toEqual([
         {
           content: [{ type: 'input_text', text: 'What is 2+2?' }],
@@ -147,8 +154,8 @@ describe('OpenAIResponsesChatProvider', () => {
       ];
       const body = await captureRequestBody(provider, 'You are a math tutor.', [], history);
 
+      expect(body['instructions']).toBe('You are a math tutor.');
       expect(body['input']).toEqual([
-        { role: 'developer', content: 'You are a math tutor.' },
         {
           content: [{ type: 'input_text', text: 'What is 2+2?' }],
           role: 'user',
@@ -197,19 +204,24 @@ describe('OpenAIResponsesChatProvider', () => {
       ]);
     });
 
-    it('OpenAI model name with date suffix matches the partial-prefix branch', async () => {
-      // gpt-4.1-2025-04-14 should be recognized as gpt-4.1, mapping system → developer.
+    it('OpenAI model name with date suffix maps history system message to developer', async () => {
+      // gpt-4.1-2025-04-14 should be recognized as gpt-4.1 for history messages.
       const provider = new OpenAIResponsesChatProvider({
         model: 'gpt-4.1-2025-04-14',
         apiKey: 'test-key',
       });
       const history: Message[] = [
+        { role: 'system', content: [{ type: 'text', text: 'Remember this.' }], toolCalls: [] },
         { role: 'user', content: [{ type: 'text', text: 'hi' }], toolCalls: [] },
       ];
-      const body = await captureRequestBody(provider, 'You are helpful.', [], history);
+      const body = await captureRequestBody(provider, '', [], history);
 
       expect(body['input']).toEqual([
-        { role: 'developer', content: 'You are helpful.' },
+        {
+          content: [{ type: 'input_text', text: 'Remember this.' }],
+          role: 'developer',
+          type: 'message',
+        },
         {
           content: [{ type: 'input_text', text: 'hi' }],
           role: 'user',
@@ -218,18 +230,23 @@ describe('OpenAIResponsesChatProvider', () => {
       ]);
     });
 
-    it('non-OpenAI model name keeps system role unchanged', async () => {
+    it('non-OpenAI model name keeps history system role unchanged', async () => {
       const provider = new OpenAIResponsesChatProvider({
         model: 'some-other-model',
         apiKey: 'test-key',
       });
       const history: Message[] = [
+        { role: 'system', content: [{ type: 'text', text: 'Remember this.' }], toolCalls: [] },
         { role: 'user', content: [{ type: 'text', text: 'hi' }], toolCalls: [] },
       ];
-      const body = await captureRequestBody(provider, 'You are helpful.', [], history);
+      const body = await captureRequestBody(provider, '', [], history);
 
       const input = body['input'] as Array<Record<string, unknown>>;
-      expect(input[0]).toEqual({ role: 'system', content: 'You are helpful.' });
+      expect(input[0]).toEqual({
+        content: [{ type: 'input_text', text: 'Remember this.' }],
+        role: 'system',
+        type: 'message',
+      });
     });
 
     it('user message with audio_url data URL (mp3) is encoded as input_file with base64', async () => {
@@ -287,7 +304,7 @@ describe('OpenAIResponsesChatProvider', () => {
       ]);
     });
 
-    it('user message with unsupported audio_url format drops the audio part silently', async () => {
+    it('user message with unsupported audio_url format degrades to placeholder text', async () => {
       const provider = createProvider();
       const history: Message[] = [
         {
@@ -302,8 +319,12 @@ describe('OpenAIResponsesChatProvider', () => {
       const body = await captureRequestBody(provider, '', [], history);
 
       const input = body['input'] as Array<{ content: unknown[] }>;
-      // Only the text part survives; the unsupported ogg audio is dropped.
-      expect(input[0]!.content).toEqual([{ type: 'input_text', text: 'Bare text' }]);
+      // The unsupported ogg audio degrades to a placeholder instead of
+      // silently vanishing, so the model knows an attachment existed.
+      expect(input[0]!.content).toEqual([
+        { type: 'input_text', text: 'Bare text' },
+        { type: 'input_text', text: '(audio omitted: unsupported audio format)' },
+      ]);
     });
 
     it('multiple consecutive ThinkParts with the same encrypted value aggregate into one reasoning item with multiple summaries', async () => {
@@ -335,6 +356,25 @@ describe('OpenAIResponsesChatProvider', () => {
           { type: 'summary_text', text: 'second thought' },
           { type: 'summary_text', text: 'third thought' },
         ],
+      });
+    });
+
+    it('serializes an explicitly empty ThinkPart as an empty reasoning summary', async () => {
+      const provider = createProvider();
+      const history: Message[] = [
+        {
+          role: 'assistant',
+          content: [{ type: 'think', think: '' }],
+          toolCalls: [],
+        },
+      ];
+
+      const body = await captureRequestBody(provider, '', [], history);
+      const input = body['input'] as Array<Record<string, unknown>>;
+
+      expect(input.find((item) => item['type'] === 'reasoning')).toMatchObject({
+        type: 'reasoning',
+        summary: [{ type: 'summary_text', text: '' }],
       });
     });
 
@@ -376,7 +416,7 @@ describe('OpenAIResponsesChatProvider', () => {
             {
               type: 'function',
               id: 'call_x',
-              function: { name: 'lookup', arguments: '{}' },
+              name: 'lookup', arguments: '{}',
             },
           ],
         },
@@ -402,6 +442,102 @@ describe('OpenAIResponsesChatProvider', () => {
       });
     });
 
+    it('toolMessageConversion=extract_text reattaches tool result media as a user message', async () => {
+      // extract_text flattens function_call_output to a plain string for
+      // backends that reject structured output. Media must not vanish with
+      // the flattening: the image-only result gets a placeholder string and
+      // the media items are reattached as a follow-up user message after
+      // the run of consecutive tool messages.
+      const provider = new OpenAIResponsesChatProvider({
+        model: 'gpt-4.1',
+        apiKey: 'test-key',
+        toolMessageConversion: 'extract_text',
+      });
+      const history: Message[] = [
+        { role: 'user', content: [{ type: 'text', text: 'Q' }], toolCalls: [] },
+        {
+          role: 'assistant',
+          content: [],
+          toolCalls: [
+            { type: 'function', id: 'call_shot', name: 'screenshot', arguments: '{}' },
+            { type: 'function', id: 'call_read', name: 'read', arguments: '{}' },
+          ],
+        },
+        {
+          role: 'tool',
+          content: [
+            { type: 'image_url', imageUrl: { url: 'https://example.com/shot.png' } },
+          ],
+          toolCallId: 'call_shot',
+          toolCalls: [],
+        },
+        {
+          role: 'tool',
+          content: [{ type: 'text', text: 'file body' }],
+          toolCallId: 'call_read',
+          toolCalls: [],
+        },
+      ];
+      const body = await captureRequestBody(provider, '', [], history);
+
+      const input = body['input'] as Array<Record<string, unknown>>;
+      expect(input).toEqual([
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Q' }] },
+        {
+          type: 'function_call',
+          call_id: 'call_shot',
+          name: 'screenshot',
+          arguments: '{}',
+        },
+        { type: 'function_call', call_id: 'call_read', name: 'read', arguments: '{}' },
+        {
+          type: 'function_call_output',
+          call_id: 'call_shot',
+          output: '(see attached media)',
+        },
+        { type: 'function_call_output', call_id: 'call_read', output: 'file body' },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_text', text: 'Attached media from tool result:' },
+            { type: 'input_image', image_url: 'https://example.com/shot.png' },
+          ],
+        },
+      ]);
+    });
+
+    it('video_url in tool result degrades to placeholder text in function_call_output', async () => {
+      const provider = createProvider();
+      const history: Message[] = [
+        { role: 'user', content: [{ type: 'text', text: 'Record it' }], toolCalls: [] },
+        {
+          role: 'assistant',
+          content: [],
+          toolCalls: [{ type: 'function', id: 'call_rec', name: 'record', arguments: '{}' }],
+        },
+        {
+          role: 'tool',
+          content: [
+            { type: 'video_url', videoUrl: { url: 'https://example.com/rec.mp4' } },
+          ],
+          toolCallId: 'call_rec',
+          toolCalls: [],
+        },
+      ];
+      const body = await captureRequestBody(provider, '', [], history);
+
+      const input = body['input'] as Array<Record<string, unknown>>;
+      const fnOutput = input.find((item) => item['type'] === 'function_call_output');
+      expect(fnOutput).toEqual({
+        type: 'function_call_output',
+        call_id: 'call_rec',
+        output: [
+          { type: 'input_text', text: '(video omitted: not supported by this provider)' },
+        ],
+      });
+    });
+
     it('parallel tool calls produce multiple function_call and function_call_output items', async () => {
       const provider = createProvider();
       const history: Message[] = [
@@ -417,12 +553,12 @@ describe('OpenAIResponsesChatProvider', () => {
             {
               type: 'function',
               id: 'call_add',
-              function: { name: 'add', arguments: '{"a": 2, "b": 3}' },
+              name: 'add', arguments: '{"a": 2, "b": 3}',
             },
             {
               type: 'function',
               id: 'call_mul',
-              function: { name: 'multiply', arguments: '{"a": 4, "b": 5}' },
+              name: 'multiply', arguments: '{"a": 4, "b": 5}',
             },
           ],
         },
@@ -552,7 +688,7 @@ describe('OpenAIResponsesChatProvider', () => {
       const toolCall: ToolCall = {
         type: 'function',
         id: 'call_abc123',
-        function: { name: 'add', arguments: '{"a": 2, "b": 3}' },
+        name: 'add', arguments: '{"a": 2, "b": 3}',
       };
       const history: Message[] = [
         { role: 'user', content: [{ type: 'text', text: 'Add 2 and 3' }], toolCalls: [] },
@@ -600,6 +736,46 @@ describe('OpenAIResponsesChatProvider', () => {
       expect(input[3]).toEqual({
         call_id: 'call_abc123',
         output: [{ type: 'input_text', text: '5' }],
+        type: 'function_call_output',
+      });
+    });
+
+    it('normalizes invalid historical tool call ids and matching function outputs', async () => {
+      const provider = createProvider();
+      const history: Message[] = [
+        { role: 'user', content: [{ type: 'text', text: 'Run bash' }], toolCalls: [] },
+        {
+          role: 'assistant',
+          content: [],
+          toolCalls: [
+            {
+              type: 'function',
+              id: 'Bash:21',
+              name: 'Bash',
+              arguments: '{"command":"pwd"}',
+            },
+          ],
+        },
+        {
+          role: 'tool',
+          content: [{ type: 'text', text: '/tmp' }],
+          toolCallId: 'Bash:21',
+          toolCalls: [],
+        },
+      ];
+
+      const body = await captureRequestBody(provider, '', [], history);
+      const input = body['input'] as unknown[];
+
+      expect(input[1]).toEqual({
+        arguments: '{"command":"pwd"}',
+        call_id: 'Bash_21',
+        name: 'Bash',
+        type: 'function_call',
+      });
+      expect(input[2]).toEqual({
+        call_id: 'Bash_21',
+        output: [{ type: 'input_text', text: '/tmp' }],
         type: 'function_call_output',
       });
     });
@@ -652,7 +828,7 @@ describe('OpenAIResponsesChatProvider', () => {
       const toolCall: ToolCall = {
         type: 'function',
         id: 'call_audio',
-        function: { name: 'tts', arguments: '{"text":"hi"}' },
+        name: 'tts', arguments: '{"text":"hi"}',
       };
       const dataUrl = 'data:audio/mp3;base64,QUJD';
       const httpsUrl = 'https://example.com/speech.wav';
@@ -695,7 +871,7 @@ describe('OpenAIResponsesChatProvider', () => {
       const toolCall: ToolCall = {
         type: 'function',
         id: 'call_abc123',
-        function: { name: 'add', arguments: '{"a": 2, "b": 3}' },
+        name: 'add', arguments: '{"a": 2, "b": 3}',
       };
       const history: Message[] = [
         { role: 'user', content: [{ type: 'text', text: 'Add 2 and 3' }], toolCalls: [] },
@@ -741,6 +917,88 @@ describe('OpenAIResponsesChatProvider', () => {
 
       expect(body['temperature']).toBe(0.7);
       expect(body['max_output_tokens']).toBe(2048);
+    });
+
+    it('withMaxCompletionTokens sets max_output_tokens on the cloned provider', async () => {
+      const original = createProvider();
+      const provider = original.withMaxCompletionTokens(1024);
+      const history: Message[] = [
+        { role: 'user', content: [{ type: 'text', text: 'Hi' }], toolCalls: [] },
+      ];
+      const body = await captureRequestBody(provider, '', [], history);
+
+      expect(provider).not.toBe(original);
+      expect(body['max_output_tokens']).toBe(1024);
+      expect(provider.maxCompletionTokens).toBe(1024);
+    });
+
+    it('maps json_schema response format to text.format', async () => {
+      const provider = createProvider();
+      const history: Message[] = [
+        { role: 'user', content: [{ type: 'text', text: 'Extract contact' }], toolCalls: [] },
+      ];
+      const schema = {
+        type: 'object',
+        properties: { name: { type: 'string' } },
+        required: ['name'],
+        additionalProperties: false,
+      };
+      const body = await captureRequestBody(provider, '', [], history, {
+        responseFormat: {
+          type: 'json_schema',
+          jsonSchema: {
+            name: 'contact',
+            schema,
+            strict: true,
+          },
+        },
+      });
+
+      expect(body['text']).toEqual({
+        format: {
+          type: 'json_schema',
+          name: 'contact',
+          schema,
+          strict: true,
+          description: undefined,
+        },
+      });
+    });
+
+    it('preserves existing Responses text options when applying response format', async () => {
+      const provider = createProvider().withGenerationKwargs({
+        text: { verbosity: 'low' },
+      });
+      const history: Message[] = [
+        { role: 'user', content: [{ type: 'text', text: 'Extract contact' }], toolCalls: [] },
+      ];
+      const schema = {
+        type: 'object',
+        properties: { name: { type: 'string' } },
+        required: ['name'],
+        additionalProperties: false,
+      };
+      const body = await captureRequestBody(provider, '', [], history, {
+        responseFormat: {
+          type: 'json_schema',
+          jsonSchema: {
+            name: 'contact',
+            schema,
+            strict: true,
+          },
+        },
+      });
+
+      expect(body['text']).toEqual({
+        verbosity: 'low',
+        format: {
+          type: 'json_schema',
+          name: 'contact',
+          schema,
+          strict: true,
+          description: undefined,
+        },
+      });
     });
   });
 
@@ -802,9 +1060,7 @@ describe('OpenAIResponsesChatProvider', () => {
       expect(body['reasoning']).toEqual({ effort: 'xhigh', summary: 'auto' });
     });
 
-    it('with_thinking("max") on gpt-5.1-codex-max clamps up to xhigh on the wire', async () => {
-      // Regression guard: "max" used to fall back to "high"; for OpenAI it
-      // must clamp up to their highest supported level, xhigh.
+    it('with_thinking("max") passes max through to the wire', async () => {
       const provider = new OpenAIResponsesChatProvider({
         model: 'gpt-5.1-codex-max',
         apiKey: 'test-key',
@@ -814,7 +1070,36 @@ describe('OpenAIResponsesChatProvider', () => {
       ];
       const body = await captureRequestBody(provider, '', [], history);
 
-      expect((body['reasoning'] as Record<string, unknown>)['effort']).toBe('xhigh');
+      expect((body['reasoning'] as Record<string, unknown>)['effort']).toBe('max');
+    });
+
+    it('passes concrete effort strings through verbatim', async () => {
+      const provider = new OpenAIResponsesChatProvider({
+        model: 'kimi-for-coding',
+        apiKey: 'test-key',
+      }).withThinking('extreme');
+      const history: Message[] = [
+        { role: 'user', content: [{ type: 'text', text: 'Think' }], toolCalls: [] },
+      ];
+      const body = await captureRequestBody(provider, '', [], history);
+
+      expect((body['reasoning'] as Record<string, unknown>)['effort']).toBe('extreme');
+      expect(provider.thinkingEffort).toBe('extreme');
+    });
+
+    it('does not filter concrete efforts through a client-side allow-list', async () => {
+      const provider = new OpenAIResponsesChatProvider({
+        model: 'kimi-for-coding',
+        apiKey: 'test-key',
+      });
+      const history: Message[] = [
+        { role: 'user', content: [{ type: 'text', text: 'Think' }], toolCalls: [] },
+      ];
+      const maxBody = await captureRequestBody(provider.withThinking('max'), '', [], history);
+      const xhighBody = await captureRequestBody(provider.withThinking('xhigh'), '', [], history);
+
+      expect((maxBody['reasoning'] as Record<string, unknown>)['effort']).toBe('max');
+      expect((xhighBody['reasoning'] as Record<string, unknown>)['effort']).toBe('xhigh');
     });
   });
 
@@ -920,7 +1205,7 @@ describe('OpenAIResponsesChatProvider', () => {
         {
           type: 'function',
           id: 'call_xyz',
-          function: { name: 'lookup', arguments: '{"q":"hi"}' },
+          name: 'lookup', arguments: '{"q":"hi"}',
         },
       ]);
     });
@@ -999,6 +1284,30 @@ describe('OpenAIResponsesChatProvider', () => {
       ]);
     });
 
+    it('yields an empty ThinkPart from a non-stream reasoning item with no summaries', async () => {
+      const provider = createProvider();
+      (provider as any)._stream = false;
+      ((provider as any)._client.responses as unknown as Record<string, unknown>)['create'] = vi
+        .fn()
+        .mockResolvedValue({
+          id: 'resp_empty_reasoning',
+          output: [
+            {
+              type: 'reasoning',
+              encrypted_content: 'enc_empty',
+              summary: [],
+            },
+          ],
+          usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+        });
+
+      const stream = await provider.generate('', [], []);
+      const parts: StreamedMessagePart[] = [];
+      for await (const part of stream) parts.push(part);
+
+      expect(parts).toEqual([{ type: 'think', think: '', encrypted: 'enc_empty' }]);
+    });
+
     it('non-stream reasoning without encrypted_content yields ThinkPart without encrypted field', async () => {
       const provider = createProvider();
       (provider as any)._stream = false;
@@ -1063,7 +1372,7 @@ describe('OpenAIResponsesChatProvider', () => {
       expect(body['max_output_tokens']).toBe(512);
     });
 
-    it('video_url in user content is silently skipped (Responses API has no video representation)', async () => {
+    it('video_url in user content degrades to placeholder text (no video input type)', async () => {
       const provider = createProvider();
       const history: Message[] = [
         {
@@ -1077,12 +1386,14 @@ describe('OpenAIResponsesChatProvider', () => {
       ];
       const body = await captureRequestBody(provider, '', [], history);
 
-      // Only the text part survives; video is dropped.
       const input = body['input'] as Array<{ content: unknown[] }>;
-      expect(input[0]!.content).toEqual([{ type: 'input_text', text: 'Watch this:' }]);
+      expect(input[0]!.content).toEqual([
+        { type: 'input_text', text: 'Watch this:' },
+        { type: 'input_text', text: '(video omitted: not supported by this provider)' },
+      ]);
     });
 
-    it('audio_url with unsupported scheme is silently dropped from user content', async () => {
+    it('audio_url with unsupported scheme degrades to placeholder text', async () => {
       const provider = createProvider();
       const history: Message[] = [
         {
@@ -1097,11 +1408,14 @@ describe('OpenAIResponsesChatProvider', () => {
       const body = await captureRequestBody(provider, '', [], history);
 
       const input = body['input'] as Array<{ content: unknown[] }>;
-      // file:// URL is unsupported → drop
-      expect(input[0]!.content).toEqual([{ type: 'input_text', text: 'Hear:' }]);
+      // file:// URL cannot be encoded as input_file → placeholder
+      expect(input[0]!.content).toEqual([
+        { type: 'input_text', text: 'Hear:' },
+        { type: 'input_text', text: '(audio omitted: unsupported audio format)' },
+      ]);
     });
 
-    it('audio_url data URL with unknown subtype is silently dropped', async () => {
+    it('audio_url data URL with unknown subtype degrades to placeholder text', async () => {
       const provider = createProvider();
       const history: Message[] = [
         {
@@ -1116,8 +1430,11 @@ describe('OpenAIResponsesChatProvider', () => {
       const body = await captureRequestBody(provider, '', [], history);
 
       const input = body['input'] as Array<{ content: unknown[] }>;
-      // ogg subtype is not mp3/wav → drop
-      expect(input[0]!.content).toEqual([{ type: 'input_text', text: 'OGG:' }]);
+      // ogg subtype is not mp3/wav → placeholder
+      expect(input[0]!.content).toEqual([
+        { type: 'input_text', text: 'OGG:' },
+        { type: 'input_text', text: '(audio omitted: unsupported audio format)' },
+      ]);
     });
   });
 
@@ -1221,7 +1538,7 @@ describe('OpenAIResponsesChatProvider', () => {
         {
           type: 'function',
           id: 'call_123',
-          function: { name: 'add', arguments: '' },
+          name: 'add', arguments: '',
           _streamIndex: 'item_123',
         },
         { type: 'tool_call_part', argumentsPart: '{"a":', index: 'item_123' },
@@ -1277,7 +1594,7 @@ describe('OpenAIResponsesChatProvider', () => {
         {
           type: 'function',
           id: 'call_done_only',
-          function: { name: 'add', arguments: '{"a": 2, "b": 3}' },
+          name: 'add', arguments: '{"a": 2, "b": 3}',
           extras: undefined,
         },
       ]);
@@ -1630,9 +1947,109 @@ describe('OpenAIResponsesChatProvider', () => {
       ];
       const stream = new OpenAIResponsesStreamedMessage(makeAsyncIterable(events), true);
 
+      let caughtError: unknown;
+      try {
+        await collectStreamParts(stream);
+      } catch (error) {
+        caughtError = error;
+      }
+
+      expect(caughtError).toBeInstanceOf(APIProviderRateLimitError);
+      expect((caughtError as APIProviderRateLimitError).statusCode).toBe(429);
+      expect((caughtError as Error).message).toMatch(/rate_limit_exceeded.*too many/);
+    });
+
+    it('normalizes malformed gateway error frames with nested rate-limit JSON', async () => {
+      const events = [
+        {
+          message:
+            'received error while streaming: {"type":"tokens","code":"rate_limit_exceeded","message":"Rate limit reached for gpt-5.5. Please try again in 325ms.","param":null}',
+        },
+      ];
+      const stream = new OpenAIResponsesStreamedMessage(makeAsyncIterable(events), true);
+
+      let caughtError: unknown;
+      try {
+        await collectStreamParts(stream);
+      } catch (error) {
+        caughtError = error;
+      }
+
+      expect(caughtError).toBeInstanceOf(APIProviderRateLimitError);
+      expect((caughtError as APIProviderRateLimitError).statusCode).toBe(429);
+      expect((caughtError as Error).message).toContain('Rate limit reached for gpt-5.5');
+      expect((caughtError as Error).message).not.toContain('stream event.type must be a string');
+    });
+
+    it('promotes an embedded upstream status_code=429 to a retryable rate limit', async () => {
+      // llmproxy forwards the original provider 429 as text inside the message
+      // (`.../responses/<id>.json status_code=429`) while the Responses API
+      // `code` is not `rate_limit_exceeded`. It must still surface as an
+      // APIProviderRateLimitError so chatWithRetry recovers it.
+      const events = [
+        {
+          type: 'error',
+          code: 'upstream_error',
+          message: 'llmproxy/openai/responses/resp_abc.json status_code=429',
+          param: null,
+        },
+      ];
+      const stream = new OpenAIResponsesStreamedMessage(makeAsyncIterable(events), true);
+
+      let caughtError: unknown;
+      try {
+        await collectStreamParts(stream);
+      } catch (error) {
+        caughtError = error;
+      }
+
+      expect(caughtError).toBeInstanceOf(APIProviderRateLimitError);
+      expect((caughtError as APIProviderRateLimitError).statusCode).toBe(429);
+      expect((caughtError as Error).message).toContain('status_code=429');
+    });
+
+    it('rejects malformed stream events with a non-string type even when message is present', async () => {
+      const events = [
+        {
+          type: 42,
+          message:
+            'received error while streaming: {"type":"tokens","code":"rate_limit_exceeded","message":"too many requests","param":null}',
+        },
+      ];
+      const stream = new OpenAIResponsesStreamedMessage(makeAsyncIterable(events), true);
+
       await expect(collectStreamParts(stream)).rejects.toThrow(
-        /rate_limit_exceeded.*too many/,
+        'OpenAI Responses decode error: stream event.type must be a string.',
       );
+    });
+
+    it('normalizes response.failed context overflow events', async () => {
+      const events = [
+        {
+          type: 'response.failed',
+          response: {
+            id: 'resp_context_overflow',
+            status: 'failed',
+            error: {
+              code: 'context_length_exceeded',
+              message:
+                'Your input exceeds the context window of this model. Please adjust your input and try again.',
+            },
+          },
+        },
+      ];
+      const stream = new OpenAIResponsesStreamedMessage(makeAsyncIterable(events), true);
+
+      let caughtError: unknown;
+      try {
+        await collectStreamParts(stream);
+      } catch (error) {
+        caughtError = error;
+      }
+
+      expect(caughtError).toBeInstanceOf(APIContextOverflowError);
+      expect((caughtError as APIContextOverflowError).statusCode).toBe(400);
+      expect((caughtError as Error).message).toMatch(/context_length_exceeded/);
     });
 
     it('throws when a known stream event is missing a required field', async () => {

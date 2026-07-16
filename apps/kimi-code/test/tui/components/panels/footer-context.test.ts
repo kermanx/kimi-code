@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import chalk from 'chalk';
 
-import { FooterComponent, formatFooterGitBadge } from '#/tui/components/chrome/footer';
+import { FooterComponent, formatFooterGitBadge, buildWeightedTips } from '#/tui/components/chrome/footer';
 import { darkColors } from '#/tui/theme/colors';
 import type { AppState } from '#/tui/types';
 
@@ -22,15 +22,14 @@ function baseState(overrides: Partial<AppState> = {}): AppState {
   return {
     model: 'k2',
     workDir: '/tmp',
+    additionalDirs: [],
     sessionId: 'sess_1',
-    yolo: false,
     permissionMode: 'manual',
     planMode: false,
-    thinking: false,
+    thinkingEffort: 'off',
     contextUsage: 0,
     contextTokens: 0,
     maxContextTokens: 0,
-    isStreaming: false,
     isCompacting: false,
     isReplaying: false,
     streamingPhase: 'idle',
@@ -46,7 +45,7 @@ function baseState(overrides: Partial<AppState> = {}): AppState {
 
 describe('FooterComponent — context NaN resilience', () => {
   it('NaN usage → renders 0.0% (never literal "NaN%")', () => {
-    const fc = new FooterComponent(baseState({ contextUsage: Number.NaN }), darkColors);
+    const fc = new FooterComponent(baseState({ contextUsage: Number.NaN }));
     const out = strip(fc.render(120).join(''));
     expect(out).not.toMatch(/NaN/);
     expect(out).toMatch(/context: 0\.0%/);
@@ -55,7 +54,6 @@ describe('FooterComponent — context NaN resilience', () => {
   it('undefined-ish (coerced) usage → renders 0.0%', () => {
     const fc = new FooterComponent(
       baseState({ contextUsage: undefined as unknown as number }),
-      darkColors,
     );
     const out = strip(fc.render(120).join(''));
     expect(out).not.toMatch(/NaN/);
@@ -63,13 +61,13 @@ describe('FooterComponent — context NaN resilience', () => {
   });
 
   it('clamps ratios above 1.0 → renders 100.0%', () => {
-    const fc = new FooterComponent(baseState({ contextUsage: 1.5 }), darkColors);
+    const fc = new FooterComponent(baseState({ contextUsage: 1.5 }));
     const out = strip(fc.render(120).join(''));
     expect(out).toMatch(/context: 100\.0%/);
   });
 
   it('ratio 0.427 → renders 42.7%', () => {
-    const fc = new FooterComponent(baseState({ contextUsage: 0.427 }), darkColors);
+    const fc = new FooterComponent(baseState({ contextUsage: 0.427 }));
     const out = strip(fc.render(200).join(''));
     expect(out).toMatch(/context: 42\.7%/);
   });
@@ -77,7 +75,6 @@ describe('FooterComponent — context NaN resilience', () => {
   it('tokens provided but max=0 → falls back to percent-only, no division-by-zero artefact', () => {
     const fc = new FooterComponent(
       baseState({ contextUsage: 0, contextTokens: 500, maxContextTokens: 0 }),
-      darkColors,
     );
     const out = strip(fc.render(200).join(''));
     expect(out).not.toMatch(/Infinity|NaN/);
@@ -87,7 +84,7 @@ describe('FooterComponent — context NaN resilience', () => {
   });
 
   it('setState updates visible model and context values', () => {
-    const footer = new FooterComponent(baseState({ model: 'k2', contextUsage: 0 }), darkColors);
+    const footer = new FooterComponent(baseState({ model: 'k2', contextUsage: 0 }));
 
     footer.setState(baseState({ model: 'kimi-k2-5', contextUsage: 0.5 }));
 
@@ -98,15 +95,15 @@ describe('FooterComponent — context NaN resilience', () => {
   });
 
   it('shows "thinking" label when thinking is enabled, hides it when disabled', () => {
-    const on = new FooterComponent(baseState({ model: 'k2', thinking: true }), darkColors);
-    const off = new FooterComponent(baseState({ model: 'k2', thinking: false }), darkColors);
+    const on = new FooterComponent(baseState({ model: 'k2', thinkingEffort: 'on' }));
+    const off = new FooterComponent(baseState({ model: 'k2', thinkingEffort: 'off' }));
 
     expect(strip(on.render(120)[0]!)).toContain('thinking');
     expect(strip(off.render(120)[0]!)).not.toContain('thinking');
   });
 
   it('renders transient hints on the context line', () => {
-    const footer = new FooterComponent(baseState(), darkColors);
+    const footer = new FooterComponent(baseState());
 
     footer.setTransientHint('Press Ctrl-C again to exit');
 
@@ -136,7 +133,7 @@ describe('FooterComponent — context NaN resilience', () => {
       );
 
       const primaryIndex = out.indexOf(hexToSgr(darkColors.primary));
-      const statusIndex = out.indexOf(hexToSgr(darkColors.status));
+      const statusIndex = out.indexOf(hexToSgr(darkColors.textDim));
       const badgeIndex = out.indexOf('[PR#6]');
       expect(statusIndex).toBeGreaterThanOrEqual(0);
       expect(primaryIndex).toBeGreaterThanOrEqual(0);
@@ -146,5 +143,49 @@ describe('FooterComponent — context NaN resilience', () => {
     } finally {
       chalk.level = previousLevel;
     }
+  });
+});
+
+describe('buildWeightedTips — weighted rotation', () => {
+  it('repeats higher-priority tips more often (length = sum of weights)', () => {
+    const seq = buildWeightedTips([
+      { text: 'a' }, // weight 1 (default)
+      { text: 'b', priority: 3 },
+      { text: 'c', priority: 2 },
+    ]);
+
+    const count = (t: string) => seq.filter((x) => x.text === t).length;
+    expect(seq).toHaveLength(6);
+    expect(count('a')).toBe(1);
+    expect(count('b')).toBe(3);
+    expect(count('c')).toBe(2);
+    expect(count('b')).toBeGreaterThan(count('a'));
+  });
+
+  it('keeps duplicates spread out — no tip sits next to itself', () => {
+    const seq = buildWeightedTips([
+      { text: 'a' },
+      { text: 'b', priority: 3 },
+      { text: 'c', priority: 2 },
+    ]);
+
+    for (let i = 1; i < seq.length; i++) {
+      expect(seq[i]!.text).not.toBe(seq[i - 1]!.text);
+    }
+  });
+
+  it('preserves array order when all weights are the default (1)', () => {
+    const seq = buildWeightedTips([{ text: 'x' }, { text: 'y' }, { text: 'z' }]);
+    expect(seq.map((t) => t.text)).toEqual(['x', 'y', 'z']);
+  });
+
+  it('clamps non-positive / fractional priorities to a weight of at least 1', () => {
+    const seq = buildWeightedTips([
+      { text: 'a', priority: 0 },
+      { text: 'b', priority: -5 },
+      { text: 'c', priority: 1.9 },
+    ]);
+    expect(seq).toHaveLength(3);
+    expect(seq.map((t) => t.text).toSorted()).toEqual(['a', 'b', 'c']);
   });
 });

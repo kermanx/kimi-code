@@ -24,12 +24,15 @@ import {
 } from '../tools/args-validator';
 import { PathSecurityError } from '../tools/policies/path-access';
 
+import { isUserCancellation } from '../utils/abort';
 import { errorMessage, isAbortError } from './errors';
 import type { LoopEventDispatcher, LoopToolCallEvent } from './events';
-import type { LLM, LLMChatResponse } from './llm';
+import { parseToolCallArguments } from './tool-args-parse';
+import type { LLM, LLMChatResponse, LLMRequestTrace } from './llm';
 import { ToolAccesses } from './tool-access';
 import { ToolScheduler, type ToolCallTask } from './tool-scheduler';
 import type {
+  AuthorizeToolExecutionResult,
   ExecutableTool,
   LoopHooks,
   ToolCall,
@@ -45,8 +48,23 @@ const TOOL_OUTPUT_NON_TEXT = 'Tool returned non-text content.';
 
 const validators = new WeakMap<ExecutableTool, ToolArgsValidator>();
 
+/**
+ * Output for an aborted tool call. When the abort carries a user-cancellation
+ * reason (the user pressed stop), say so explicitly so the model treats it as a
+ * deliberate interruption instead of a system fault to theorise about or retry.
+ * Any other abort keeps the neutral wording.
+ */
+function abortedToolOutput(toolName: string, signal: AbortSignal): string {
+  if (isUserCancellation(signal.reason)) {
+    return `The user manually interrupted "${toolName}" (and anything else running at the same time). This was a deliberate user action, not a system error, timeout, or capacity limit. Do not retry automatically or guess at the cause — wait for the user's next instruction.`;
+  }
+  return `Tool "${toolName}" was aborted`;
+}
+
 export interface ToolCallStepContext {
   readonly tools?: readonly ExecutableTool[] | undefined;
+  /** See RunTurnInput.describeMissingTool. */
+  readonly describeMissingTool?: ((name: string) => string | undefined) | undefined;
   readonly hooks?: LoopHooks | undefined;
   readonly log?: Logger | undefined;
   readonly dispatchEvent: LoopEventDispatcher;
@@ -55,6 +73,11 @@ export interface ToolCallStepContext {
   readonly turnId: string;
   readonly currentStep: number;
   readonly stepUuid: string;
+  readonly trace: LLMRequestTrace;
+}
+
+interface ToolCallBatchContext extends ToolCallStepContext {
+  readonly toolCalls: readonly ToolCall[];
 }
 
 type PreflightedToolCall = RunnableToolCall | RejectedToolCall;
@@ -105,7 +128,8 @@ export async function runToolCallBatch(
   response: LLMChatResponse,
 ): Promise<ToolCallBatchResult> {
   if (response.toolCalls.length === 0) return { stopTurn: false };
-  const calls = response.toolCalls.map((toolCall) => preflightToolCall(step.tools, toolCall));
+  const batchStep: ToolCallBatchContext = { ...step, toolCalls: response.toolCalls };
+  const calls = response.toolCalls.map((toolCall) => preflightToolCall(step, toolCall));
   const scheduler = new ToolScheduler<PendingToolResult>();
   const pendingResults: Array<Promise<PendingToolResult>> = [];
   let stopTurn = false;
@@ -113,13 +137,13 @@ export async function runToolCallBatch(
   try {
     for (let index = 0; index < calls.length; index += 1) {
       const call = calls[index]!;
-      const prepared = await prepareToolCall(step, call);
+      const prepared = await prepareToolCall(batchStep, call);
       pendingResults.push(scheduler.add(prepared.task));
 
       if (prepared.stopBatchAfterThis === true) {
         stopTurn = true;
         for (const skippedCall of calls.slice(index + 1)) {
-          const skippedTask = await prepareSkippedToolCall(step, skippedCall);
+          const skippedTask = await prepareSkippedToolCall(batchStep, skippedCall);
           pendingResults.push(scheduler.add(skippedTask));
         }
         break;
@@ -130,13 +154,14 @@ export async function runToolCallBatch(
     // provider order. Await all tasks so each recorded `tool.call` gets a
     // paired `tool.result`; the caller checks abort before writing `step.end`.
     for (const pendingResult of pendingResults) {
-      const result = await finalizePendingToolResult(step, await pendingResult);
+      const result = await finalizePendingToolResult(batchStep, await pendingResult);
       if (result.stopTurn === true) stopTurn = true;
       await step.dispatchEvent({
         type: 'tool.result',
         parentUuid: result.toolCall.id,
         toolCallId: result.toolCall.id,
         result: result.result,
+        traceId: step.trace.traceId,
       });
     }
   } finally {
@@ -153,31 +178,31 @@ export async function runToolCallBatch(
  * events. Validator compilation may populate the local cache.
  */
 function preflightToolCall(
-  tools: readonly ExecutableTool[] | undefined,
+  step: Pick<ToolCallStepContext, 'tools' | 'describeMissingTool' | 'log'>,
   toolCall: ToolCall,
 ): PreflightedToolCall {
-  const toolName = toolCall.function.name;
-  const parsedArgs = parseToolCallArguments(toolCall.function.arguments);
-  const args = parsedArgs.success ? parsedArgs.data : {};
-  const tool = tools?.find((candidate) => candidate.name === toolName);
+  const toolName = toolCall.name;
+  const parsedArgs = parseToolCallArguments(toolCall.arguments);
+  const tool = step.tools?.find((candidate) => candidate.name === toolName);
   if (tool === undefined) {
     return {
       kind: 'rejected',
       toolCall,
       toolName,
-      args,
-      output: `Tool "${toolName}" not found`,
+      args: parsedArgs.data,
+      output: step.describeMissingTool?.(toolName) ?? `Tool "${toolName}" not found`,
     };
   }
-  if (!parsedArgs.success) {
-    return {
-      kind: 'rejected',
-      toolCall,
+
+  if (parsedArgs.parseFailed) {
+    step.log?.debug('tool args JSON parse failed', {
       toolName,
-      args,
-      output: `Invalid args for tool "${toolName}": malformed JSON in arguments: ${parsedArgs.error}`,
-    };
+      toolCallId: toolCall.id,
+      rawLength: toolCall.arguments?.length ?? 0,
+      error: parsedArgs.error,
+    });
   }
+
   const validationError = validateExecutableToolArgs(tool, parsedArgs.data);
   if (validationError !== null) {
     return {
@@ -189,21 +214,6 @@ function preflightToolCall(
     };
   }
   return { kind: 'runnable', toolCall, toolName, tool, args: parsedArgs.data };
-}
-
-function parseToolCallArguments(
-  raw: string | null,
-):
-  | { readonly success: true; readonly data: unknown }
-  | { readonly success: false; readonly error: string } {
-  if (raw === null || raw.length === 0) {
-    return { success: true, data: {} };
-  }
-  try {
-    return { success: true, data: JSON.parse(raw) as unknown };
-  } catch (error) {
-    return { success: false, error: errorMessage(error) };
-  }
 }
 
 function validateExecutableToolArgs(tool: ExecutableTool, args: unknown): string | null {
@@ -220,48 +230,53 @@ function validateExecutableToolArgs(tool: ExecutableTool, args: unknown): string
 }
 
 async function prepareToolCall(
-  step: ToolCallStepContext,
+  step: ToolCallBatchContext,
   call: PreflightedToolCall,
 ): Promise<PreparedToolCallTask> {
-  if (call.kind === 'rejected') {
-    await dispatchToolCall(step, call, call.args);
-    return { task: makeResolvedToolCallTask(makeErrorToolResult(call, call.args, call.output)) };
-  }
+  const settleError = async (
+    args: unknown,
+    output: string,
+    displayFields?: ToolCallDisplayFields,
+  ): Promise<PreparedToolCallTask> => {
+    await dispatchToolCall(step, call, args, displayFields);
+    return { task: makeResolvedToolCallTask(makeErrorToolResult(call, args, output)) };
+  };
+
+  const settleSynthetic = async (
+    args: unknown,
+    result: ExecutableToolResult,
+    displayFields?: ToolCallDisplayFields,
+  ): Promise<PreparedToolCallTask> => {
+    const coerced = coerceToolResult(result, call.toolName);
+    await dispatchToolCall(step, call, args, displayFields);
+    return {
+      task: makeResolvedToolCallTask(makeToolResult(call, args, coerced)),
+      stopBatchAfterThis: toolResultStopsTurn(coerced),
+    };
+  };
+
+  if (call.kind === 'rejected') return settleError(call.args, call.output);
 
   const decision = await runPrepareToolExecutionHook(step, call);
-  if (decision.kind === 'blocked') {
-    await dispatchToolCall(step, call, decision.args);
-    return {
-      task: makeResolvedToolCallTask(makeErrorToolResult(call, decision.args, decision.output)),
-    };
+  if (decision.kind === 'blocked' || decision.kind === 'hookFailed') {
+    return settleError(decision.args, decision.output);
   }
-
-  if (decision.kind === 'hookFailed') {
-    await dispatchToolCall(step, call, decision.args);
-    return {
-      task: makeResolvedToolCallTask(makeErrorToolResult(call, decision.args, decision.output)),
-    };
-  }
-
   if (decision.kind === 'synthetic') {
-    await dispatchToolCall(step, call, decision.args);
-    return {
-      task: makeResolvedToolCallTask(makeToolResult(call, decision.args, decision.result)),
-      stopBatchAfterThis: toolResultStopsTurn(decision.result),
-    };
+    return settleSynthetic(decision.args, decision.result);
   }
 
   const validationError = validateExecutableToolArgs(call.tool, decision.args);
   if (validationError !== null) {
-    await dispatchToolCall(step, call, decision.args);
-    const output = `Invalid args for tool "${call.toolName}" after prepareToolExecution hook: ${validationError}`;
-    return { task: makeResolvedToolCallTask(makeErrorToolResult(call, decision.args, output)) };
+    return settleError(
+      decision.args,
+      `Invalid args for tool "${call.toolName}" after prepareToolExecution hook: ${validationError}`,
+    );
   }
 
   const effectiveArgs = decision.args;
   let execution: ToolExecution;
   try {
-    execution = call.tool.resolveExecution(effectiveArgs);
+    execution = await call.tool.resolveExecution(effectiveArgs);
   } catch (error) {
     if (!(error instanceof PathSecurityError)) {
       step.log?.warn('tool execution setup failed', {
@@ -274,42 +289,49 @@ async function prepareToolCall(
       error instanceof PathSecurityError
         ? error.message
         : `Tool "${call.toolName}" failed to resolve execution: ${errorMessage(error)}`;
-    await dispatchToolCall(step, call, effectiveArgs);
-    return {
-      task: makeResolvedToolCallTask(makeErrorToolResult(call, effectiveArgs, output)),
-    };
+    return settleError(effectiveArgs, output);
   }
 
   const displayFields = toolCallDisplayFieldsFromExecution(execution);
-  await dispatchToolCall(step, call, effectiveArgs, displayFields);
+  const settleAborted = (): Promise<PreparedToolCallTask> =>
+    settleError(effectiveArgs, abortedToolOutput(call.toolName, step.signal), displayFields);
 
-  if (step.signal.aborted) {
-    return {
-      task: makeResolvedToolCallTask(
-        makeErrorToolResult(call, effectiveArgs, `Tool "${call.toolName}" was aborted`),
-      ),
-    };
-  }
+  if (step.signal.aborted) return settleAborted();
 
   if (execution.isError === true) {
-    return {
-      task: makeResolvedToolCallTask(makeToolResult(call, effectiveArgs, execution)),
-      stopBatchAfterThis: execution.stopTurn,
-    };
+    return settleSynthetic(effectiveArgs, execution, displayFields);
   }
 
+  const authorization = await runAuthorizeToolExecutionHook(step, call, effectiveArgs, execution);
+  if (step.signal.aborted) return settleAborted();
+
+  if (authorization?.block === true) {
+    return settleError(
+      effectiveArgs,
+      authorization.reason ?? `Tool call "${call.toolName}" was blocked`,
+      displayFields,
+    );
+  }
+
+  if (authorization?.syntheticResult !== undefined) {
+    return settleSynthetic(effectiveArgs, authorization.syntheticResult, displayFields);
+  }
+
+  const executionMetadata = authorization?.executionMetadata ?? decision.metadata;
+  await dispatchToolCall(step, call, effectiveArgs, displayFields);
   return {
     task: {
       accesses: execution.accesses ?? ToolAccesses.all(),
       start: async () => ({
-        result: runRunnableToolCall(step, call, effectiveArgs, decision.metadata, execution),
+        result: runRunnableToolCall(step, call, effectiveArgs, executionMetadata, execution),
       }),
     },
+    stopBatchAfterThis: execution.stopBatchAfterThis,
   };
 }
 
 async function prepareSkippedToolCall(
-  step: ToolCallStepContext,
+  step: ToolCallBatchContext,
   call: PreflightedToolCall,
 ): Promise<ToolCallTask<PendingToolResult>> {
   const output = 'Tool skipped because a previous tool call stopped the turn.';
@@ -329,7 +351,7 @@ function makeResolvedToolCallTask(result: PendingToolResult): ToolCallTask<Pendi
  * Hook decisions can block a call or replace args before execution starts.
  */
 async function runPrepareToolExecutionHook(
-  step: ToolCallStepContext,
+  step: ToolCallBatchContext,
   call: RunnableToolCall,
 ): Promise<PrepareToolExecutionDecision> {
   const { hooks, signal, turnId, currentStep, llm } = step;
@@ -343,10 +365,12 @@ async function runPrepareToolExecutionHook(
   try {
     hookResult = await hooks.prepareToolExecution({
       toolCall,
+      toolCalls: step.toolCalls,
       tool: call.tool,
       args,
       turnId,
       stepNumber: currentStep,
+      traceId: step.trace.traceId,
       signal,
       llm,
     });
@@ -383,6 +407,42 @@ async function runPrepareToolExecutionHook(
   return { kind: 'allowed', args: effectiveArgs, metadata: hookResult?.executionMetadata };
 }
 
+async function runAuthorizeToolExecutionHook(
+  step: ToolCallBatchContext,
+  call: RunnableToolCall,
+  args: unknown,
+  execution: RunnableToolExecution,
+): Promise<AuthorizeToolExecutionResult | undefined> {
+  const { hooks, signal, turnId, currentStep, llm } = step;
+  if (hooks?.authorizeToolExecution === undefined) return undefined;
+
+  try {
+    return await hooks.authorizeToolExecution({
+      toolCall: call.toolCall,
+      toolCalls: step.toolCalls,
+      tool: call.tool,
+      args,
+      execution,
+      turnId,
+      stepNumber: currentStep,
+      traceId: step.trace.traceId,
+      signal,
+      llm,
+    });
+  } catch (error) {
+    if (isAbortError(error) || signal.aborted) {
+      return {
+        block: true,
+        reason: `Tool "${call.toolName}" was aborted during authorizeToolExecution hook`,
+      };
+    }
+    return {
+      block: true,
+      reason: `authorizeToolExecution hook failed for "${call.toolName}": ${errorMessage(error)}`,
+    };
+  }
+}
+
 function toolCallDisplayFieldsFromExecution(
   execution: ToolExecution,
 ): ToolCallDisplayFields | undefined {
@@ -406,12 +466,13 @@ async function runRunnableToolCall(
   const { toolCall, toolName } = call;
 
   if (signal.aborted) {
-    return makeErrorToolResult(call, effectiveArgs, `Tool "${toolName}" was aborted`);
+    return makeErrorToolResult(call, effectiveArgs, abortedToolOutput(toolName, signal));
   }
 
   let toolResult: ExecutableToolResult;
   try {
-    toolResult = await executeTool(step, execution, toolCall, toolName, metadata);
+    const raw = await executeTool(step, execution, toolCall, toolName, metadata);
+    toolResult = coerceToolResult(raw, toolName);
   } catch (error) {
     const aborted = isAbortError(error) || signal.aborted;
     if (!aborted) {
@@ -422,7 +483,7 @@ async function runRunnableToolCall(
       });
     }
     const output = aborted
-      ? `Tool "${toolName}" was aborted`
+      ? abortedToolOutput(toolName, signal)
       : `Tool "${toolName}" failed: ${errorMessage(error)}`;
     return makeErrorToolResult(call, effectiveArgs, output);
   }
@@ -431,7 +492,7 @@ async function runRunnableToolCall(
 }
 
 async function finalizePendingToolResult(
-  step: ToolCallStepContext,
+  step: ToolCallBatchContext,
   pendingResult: PendingToolResult,
 ): Promise<PendingToolResult> {
   const { hooks, signal, turnId, currentStep, llm } = step;
@@ -442,14 +503,19 @@ async function finalizePendingToolResult(
   try {
     const finalizedResult = await hooks.finalizeToolResult({
       toolCall: pendingResult.toolCall,
+      toolCalls: step.toolCalls,
       args: pendingResult.args,
       result: pendingResult.result,
       turnId,
       stepNumber: currentStep,
+      traceId: step.trace.traceId,
       signal,
       llm,
     });
-    const effectiveResult = finalizedResult ?? pendingResult.result;
+    const effectiveResult = coerceToolResult(
+      finalizedResult ?? pendingResult.result,
+      pendingResult.toolName,
+    );
     return {
       ...pendingResult,
       stopTurn: pendingResult.stopTurn === true || toolResultStopsTurn(effectiveResult),
@@ -491,6 +557,7 @@ async function executeTool(
   const executePromise = execution.execute({
     turnId,
     toolCallId: toolCall.id,
+    traceId: step.trace.traceId,
     metadata,
     signal,
     onUpdate: (update) => {
@@ -550,6 +617,33 @@ function isMediaContentPart(part: ContentPart): boolean {
   return part.type === 'image_url' || part.type === 'audio_url' || part.type === 'video_url';
 }
 
+/**
+ * Validate a tool's raw return against the {@link ExecutableToolResult} contract.
+ * A tool that returns `undefined`, a primitive, or an object without a valid
+ * `output` field is coerced into an `isError: true` result so the loop can still
+ * emit a paired `tool.result` event. This is the trust boundary between
+ * arbitrary tool implementations and the rest of the loop.
+ */
+function coerceToolResult(value: unknown, toolName: string): ExecutableToolResult {
+  if (value === null || value === undefined) {
+    return { output: `Tool "${toolName}" returned no result.`, isError: true };
+  }
+  if (typeof value !== 'object') {
+    return {
+      output: `Tool "${toolName}" returned a ${typeof value} instead of a tool result.`,
+      isError: true,
+    };
+  }
+  const candidate = value as { output?: unknown };
+  if (typeof candidate.output !== 'string' && !Array.isArray(candidate.output)) {
+    return {
+      output: `Tool "${toolName}" returned a result with a missing or malformed "output" field.`,
+      isError: true,
+    };
+  }
+  return value as ExecutableToolResult;
+}
+
 function normalizeToolResult(r: ExecutableToolResult): ExecutableToolResult {
   let output: ExecutableToolResult['output'];
   if (typeof r.output === 'string') {
@@ -571,7 +665,19 @@ function normalizeToolResult(r: ExecutableToolResult): ExecutableToolResult {
       output = textJoined.length > 0 ? textJoined : TOOL_OUTPUT_EMPTY;
     }
   }
-  return r.isError === true ? { output, isError: true } : { output };
+  // Rebuild keeps the persisted contract only: `note` rides into the record
+  // (the model reads it at projection), while `stopTurn`/`message` are
+  // loop/UI-local and are dropped here. Tools are arbitrary JS, so this is
+  // also where the note contract (string | undefined) is enforced: a
+  // malformed or empty note is discarded — the tool's actual output is
+  // still valid, and everything downstream trusts the contract.
+  const base: { output: typeof output; note?: string; truncated?: true } = { output };
+  if (typeof r.note === 'string' && r.note.length > 0) base.note = r.note;
+  if (r.truncated === true) base.truncated = true;
+  if (r.isError === true) {
+    return { ...base, isError: true };
+  }
+  return base;
 }
 
 function makeToolResult(
@@ -589,7 +695,7 @@ function makeToolResult(
 }
 
 function toolResultStopsTurn(result: ExecutableToolResult): boolean {
-  return result.isError === true && result.stopTurn === true;
+  return result.stopTurn === true;
 }
 
 function makeErrorToolResult(
@@ -622,5 +728,7 @@ async function dispatchToolCall(
     args,
     description: displayFields?.description,
     display: displayFields?.display,
+    extras: toolCall.extras,
+    traceId: step.trace.traceId,
   });
 }

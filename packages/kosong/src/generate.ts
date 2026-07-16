@@ -39,6 +39,11 @@ export interface GenerateResult {
    * `null` if the provider did not emit one.
    */
   readonly rawFinishReason: string | null;
+  /**
+   * Provider trace identifier from the `x-trace-id` response header
+   * (Kimi/KFC only), or `null` when the provider does not report one.
+   */
+  readonly traceId?: string | null;
 }
 
 export interface GenerateCallbacks {
@@ -103,59 +108,105 @@ export async function generate(
     throwAbortError();
   }
 
-  const stream = await provider.generate(systemPrompt, tools, history, options);
+  // Deferred tools are executable client-side but must not appear in the
+  // request's top-level `tools[]` (their schemas travel via message-level
+  // `tools` declarations; the top-level list stays byte-stable for prompt
+  // caching). This is the single strip point for every provider call.
+  const wireTools = tools.some((tool) => tool.deferred === true)
+    ? tools.filter((tool) => tool.deferred !== true)
+    : tools;
+
+  options?.onRequestStart?.();
+  const stream = await provider.generate(systemPrompt, wireTools, history, options);
+  // Early capture: the trace id arrives with the response headers, before the
+  // stream body — and before any mid-stream abort — so hosts can attribute
+  // even a cancelled stream to its server-side request.
+  if (stream.traceId !== undefined) {
+    options?.onTraceId?.(stream.traceId);
+  }
 
   // Post-await abort check: `provider.generate()` may have resolved before
   // noticing a mid-flight abort. Reject immediately rather than draining
   // the stream.
   await throwIfAborted(options?.signal, stream);
 
+  // Decode-phase accounting. We split the window from the first streamed part
+  // to stream end into time spent awaiting the next part (server + network) vs.
+  // time spent processing each part in-process (deep copy, host callback, part
+  // merge). `lastResumeAt` marks the end of the previous part's processing, so
+  // the gap until the next part arrives is attributed to the server. The
+  // per-part processing is wrapped in try/finally so the accounting stays
+  // correct across `continue` and thrown aborts.
+  let serverDecodeMs = 0;
+  let clientConsumeMs = 0;
+  let firstPartAt: number | undefined;
+  let lastResumeAt = 0;
+
   for await (const part of stream) {
-    await throwIfAborted(options?.signal, stream);
+    const arrivedAt = Date.now();
+    if (firstPartAt === undefined) {
+      firstPartAt = arrivedAt;
+    } else {
+      serverDecodeMs += arrivedAt - lastResumeAt;
+    }
 
-    // Notify raw part callback (deep copy to avoid aliasing mutations).
-    if (callbacks?.onMessagePart !== undefined) {
-      await callbacks.onMessagePart(deepCopyPart(part));
+    try {
       await throwIfAborted(options?.signal, stream);
-    }
 
-    // Index-based routing for parallel tool call argument deltas.
-    // When a ToolCallPart arrives with an index referring to a tool call
-    // that is NOT the currently-pending one, append it directly to the
-    // correct ToolCall in message.toolCalls instead of relying on sequential
-    // merging. This prevents argument cross-contamination across parallel calls.
-    if (
-      isToolCallPart(part) &&
-      part.index !== undefined &&
-      !isPendingToolCallAtIndex(pendingPart, part.index)
-    ) {
-      const arrayIdx = toolCallIndexMap.get(part.index);
-      if (arrayIdx !== undefined) {
-        const target = message.toolCalls[arrayIdx];
-        if (target !== undefined && part.argumentsPart !== null) {
-          target.function.arguments =
-            target.function.arguments === null
-              ? part.argumentsPart
-              : target.function.arguments + part.argumentsPart;
-        }
-        continue;
+      // Notify raw part callback (deep copy to avoid aliasing mutations).
+      if (callbacks?.onMessagePart !== undefined) {
+        await callbacks.onMessagePart(deepCopyPart(part));
+        await throwIfAborted(options?.signal, stream);
       }
-      // Unknown index — fall through to the sequential logic as a safety net.
-    }
 
-    if (pendingPart === null) {
-      pendingPart = part;
-    } else if (!mergeInPlace(pendingPart, part)) {
-      // Could not merge — flush the pending part and start a new one.
-      // For parallel tool calls this happens when a new ToolCall header arrives
-      // while a previous ToolCall is still pending; the flush finalizes the
-      // previous tool call into `message.toolCalls`.
-      flushPart(message, pendingPart, toolCallIndexMap);
-      pendingPart = part;
+      // Index-based routing for parallel tool call argument deltas.
+      // When a ToolCallPart arrives with an index referring to a tool call
+      // that is NOT the currently-pending one, append it directly to the
+      // correct ToolCall in message.toolCalls instead of relying on sequential
+      // merging. This prevents argument cross-contamination across parallel calls.
+      if (
+        isToolCallPart(part) &&
+        part.index !== undefined &&
+        !isPendingToolCallAtIndex(pendingPart, part.index)
+      ) {
+        const arrayIdx = toolCallIndexMap.get(part.index);
+        if (arrayIdx !== undefined) {
+          const target = message.toolCalls[arrayIdx];
+          if (target !== undefined && part.argumentsPart !== null) {
+            target.arguments =
+              target.arguments === null
+                ? part.argumentsPart
+                : target.arguments + part.argumentsPart;
+          }
+          continue;
+        }
+        // Unknown index — fall through to the sequential logic as a safety net.
+      }
+
+      if (pendingPart === null) {
+        pendingPart = part;
+      } else if (!mergeInPlace(pendingPart, part)) {
+        // Could not merge — flush the pending part and start a new one.
+        // For parallel tool calls this happens when a new ToolCall header arrives
+        // while a previous ToolCall is still pending; the flush finalizes the
+        // previous tool call into `message.toolCalls`.
+        flushPart(message, pendingPart, toolCallIndexMap);
+        pendingPart = part;
+      }
+    } finally {
+      lastResumeAt = Date.now();
+      clientConsumeMs += lastResumeAt - arrivedAt;
     }
   }
 
   await throwIfAborted(options?.signal, stream);
+  if (firstPartAt !== undefined) {
+    // Tail wait: from the last processed part to the stream's done signal.
+    serverDecodeMs += Date.now() - lastResumeAt;
+  }
+  options?.onStreamEnd?.(
+    firstPartAt === undefined ? undefined : { serverDecodeMs, clientConsumeMs },
+  );
 
   // Flush the last pending part.
   if (pendingPart !== null) {
@@ -163,7 +214,13 @@ export async function generate(
   }
   if (message.content.length === 0 && message.toolCalls.length === 0) {
     throw new APIEmptyResponseError(
-      `The API returned an empty response (no content, no tool calls). Provider: ${provider.name}, model: ${provider.modelName}`,
+      'The API returned an empty response (no content, no tool calls).' +
+        formatFinishReasonHint(stream) +
+        ` Provider: ${provider.name}, model: ${provider.modelName}`,
+      {
+        finishReason: stream.finishReason,
+        rawFinishReason: stream.rawFinishReason,
+      },
     );
   }
 
@@ -177,7 +234,13 @@ export async function generate(
       'The API returned a response containing only thinking content ' +
         'without any text or tool calls. This usually indicates the ' +
         'stream was interrupted or the output token budget was exhausted ' +
-        `during reasoning. Provider: ${provider.name}, model: ${provider.modelName}`,
+        'during reasoning.' +
+        formatFinishReasonHint(stream) +
+        ` Provider: ${provider.name}, model: ${provider.modelName}`,
+      {
+        finishReason: stream.finishReason,
+        rawFinishReason: stream.rawFinishReason,
+      },
     );
   }
 
@@ -189,13 +252,17 @@ export async function generate(
     }
   }
 
-  return {
+  const result: GenerateResult = {
     id: stream.id,
     message,
     usage: stream.usage,
     finishReason: stream.finishReason,
     rawFinishReason: stream.rawFinishReason,
   };
+  if (stream.traceId !== undefined) {
+    return { ...result, traceId: stream.traceId };
+  }
+  return result;
 }
 
 type CancelableStream = StreamedMessage & {
@@ -261,7 +328,8 @@ function flushPart(
     const stored: StoredToolCall = {
       type: 'function',
       id: part.id,
-      function: part.function,
+      name: part.name,
+      arguments: part.arguments,
       extras: part.extras,
     };
     const ordinal = message.toolCalls.length;
@@ -271,6 +339,19 @@ function flushPart(
     }
   }
   // ToolCallPart: orphaned delta — silently ignore.
+}
+
+function formatFinishReasonHint(stream: StreamedMessage): string {
+  if (stream.finishReason === null && stream.rawFinishReason === null) return '';
+
+  const raw =
+    stream.rawFinishReason === null ? '' : `, rawFinishReason=${stream.rawFinishReason}`;
+  const filteredHint =
+    stream.finishReason === 'filtered'
+      ? ' The provider filtered the response before visible output was emitted.'
+      : '';
+
+  return ` Provider stop details: finishReason=${stream.finishReason ?? 'unknown'}${raw}.${filteredHint}`;
 }
 
 /**

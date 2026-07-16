@@ -8,9 +8,10 @@ import { renderPrompt } from '../../../utils/render-prompt';
 import { resolvePathAccessPath } from '../../policies/path-access';
 import { MEDIA_SNIFF_BYTES, detectFileType } from '../../support/file-type';
 import { toInputJsonSchema } from '../../support/input-schema';
+import { literalRulePattern, matchesPathRuleSubject } from '../../support/rule-match';
 import type { WorkspaceConfig } from '../../support/workspace';
 import { makeCarriageReturnsVisible, type LineEndingStyle } from './line-endings';
-import readDescriptionTemplate from './read.md';
+import readDescriptionTemplate from './read.md?raw';
 
 export const MAX_LINES: number = 1000;
 export const MAX_LINE_LENGTH: number = 2000;
@@ -78,6 +79,36 @@ interface FinishReadResultInput {
   readonly requestedLines: number;
 }
 
+type TextPreviewKaos = Kaos & {
+  readTextPreview?: (path: string, n: number) => Promise<Buffer>;
+};
+
+interface TextFileScan {
+  totalLines: number;
+  endsWithNewline: boolean;
+  hasNul: boolean;
+  lineEndingFlags: LineEndingFlags;
+}
+
+type RangeReadKaos = TextPreviewKaos & {
+  scanTextFile?: (path: string) => Promise<TextFileScan>;
+  readLineRange?: (
+    path: string,
+    options: { startLine: number; maxLines: number; errors?: 'strict' | 'replace' | 'ignore' },
+  ) => AsyncGenerator<string>;
+  readTailLines?: (
+    path: string,
+    options: { tailCount: number; errors?: 'strict' | 'replace' | 'ignore' },
+  ) => AsyncGenerator<string>;
+};
+
+async function readTextHeader(kaos: TextPreviewKaos, path: string, n: number): Promise<Buffer> {
+  if (kaos.readTextPreview !== undefined) {
+    return kaos.readTextPreview(path, n);
+  }
+  return kaos.readBytes(path, n);
+}
+
 function truncateLine(line: string, maxLength: number): string {
   if (line.length <= maxLength) return line;
   const marker = '...';
@@ -127,6 +158,41 @@ function renderLine(entry: ReadLineEntry, lineEndingStyle: LineEndingStyle): Ren
 
 function renderedLineBytes(renderedLine: string, isFirst: boolean): number {
   return (isFirst ? 0 : 1) + Buffer.byteLength(renderedLine, 'utf8');
+}
+
+function renderEntries(
+  entries: readonly ReadLineEntry[],
+  lineEndingStyle: LineEndingStyle,
+): {
+  renderedLines: string[];
+  truncatedLineNumbers: number[];
+  maxBytesReached: boolean;
+} {
+  const renderedLines: string[] = [];
+  const truncatedLineNumbers: number[] = [];
+  let bytes = 0;
+  let maxBytesReached = false;
+
+  for (const entry of entries) {
+    const rendered = renderLine(entry, lineEndingStyle);
+    const lineBytes = renderedLineBytes(rendered.line, renderedLines.length === 0);
+    if (renderedLines.length > 0 && bytes + lineBytes > MAX_BYTES) {
+      maxBytesReached = true;
+      break;
+    }
+
+    if (rendered.wasTruncated) {
+      truncatedLineNumbers.push(entry.lineNo);
+    }
+    renderedLines.push(rendered.line);
+    bytes += lineBytes;
+    if (bytes >= MAX_BYTES) {
+      maxBytesReached = true;
+      break;
+    }
+  }
+
+  return { renderedLines, truncatedLineNumbers, maxBytesReached };
 }
 
 function isRegularFileMode(stMode: number): boolean {
@@ -183,6 +249,14 @@ export class ReadTool implements BuiltinTool<ReadInput> {
     return {
       accesses: ToolAccesses.readFile(path),
       description: `Reading ${args.path}`,
+      display: { kind: 'file_io', operation: 'read', path },
+      approvalRule: literalRulePattern(this.name, path),
+      matchesRule: (ruleArgs) =>
+        matchesPathRuleSubject(ruleArgs, path, {
+          cwd: this.workspace.workspaceDir,
+          pathClass: this.kaos.pathClass(),
+          homeDir: this.kaos.gethome(),
+        }),
       execute: () => this.execution(args, path),
     };
   }
@@ -202,7 +276,7 @@ export class ReadTool implements BuiltinTool<ReadInput> {
         return { isError: true, output: `"${args.path}" is not a file.` };
       }
 
-      const header = await this.kaos.readBytes(safePath, MEDIA_SNIFF_BYTES);
+      const header = await readTextHeader(this.kaos, safePath, MEDIA_SNIFF_BYTES);
       const fileType = detectFileType(safePath, header);
       if (fileType.kind === 'image' || fileType.kind === 'video') {
         return {
@@ -255,6 +329,36 @@ export class ReadTool implements BuiltinTool<ReadInput> {
     effectiveLimit: number,
     requestedLines: number,
   ): Promise<ExecutableToolResult> {
+    const rangeKaos = this.kaos as RangeReadKaos;
+    if (rangeKaos.scanTextFile !== undefined && rangeKaos.readLineRange !== undefined) {
+      const scan = await rangeKaos.scanTextFile(safePath);
+      if (scan.hasNul) {
+        return { isError: true, output: notReadableFileOutput(displayPath) };
+      }
+      const selectedEntries: ReadLineEntry[] = [];
+      let lineNo = lineOffset;
+      for await (const rawLine of rangeKaos.readLineRange(safePath, {
+        startLine: lineOffset,
+        maxLines: effectiveLimit,
+        errors: 'strict',
+      })) {
+        selectedEntries.push({ lineNo, rawContent: stripTrailingLf(rawLine) });
+        lineNo += 1;
+      }
+      const lineEndingStyle = lineEndingStyleFromFlags(scan.lineEndingFlags);
+      const rendered = renderEntries(selectedEntries, lineEndingStyle);
+      return this.finishReadResult({
+        renderedLines: rendered.renderedLines,
+        truncatedLineNumbers: rendered.truncatedLineNumbers,
+        maxLinesReached: effectiveLimit >= MAX_LINES && lineOffset + MAX_LINES <= scan.totalLines,
+        maxBytesReached: rendered.maxBytesReached,
+        lineEndingStyle,
+        startLine: selectedEntries.length > 0 ? lineOffset : 0,
+        totalLines: scan.totalLines,
+        requestedLines,
+      });
+    }
+
     const selectedEntries: ReadLineEntry[] = [];
     const flags: LineEndingFlags = { hasCrLf: false, hasLf: false, hasLoneCr: false };
     let currentLineNo = 0;
@@ -291,37 +395,15 @@ export class ReadTool implements BuiltinTool<ReadInput> {
     }
 
     const lineEndingStyle = lineEndingStyleFromFlags(flags);
-    const renderedLines: string[] = [];
-    const truncatedLineNumbers: number[] = [];
-    let bytes = 0;
-    let maxBytesReached = false;
-
-    for (const entry of selectedEntries) {
-      const rendered = renderLine(entry, lineEndingStyle);
-      const lineBytes = renderedLineBytes(rendered.line, renderedLines.length === 0);
-      if (renderedLines.length > 0 && bytes + lineBytes > MAX_BYTES) {
-        maxBytesReached = true;
-        break;
-      }
-
-      if (rendered.wasTruncated) {
-        truncatedLineNumbers.push(entry.lineNo);
-      }
-      renderedLines.push(rendered.line);
-      bytes += lineBytes;
-      if (bytes >= MAX_BYTES) {
-        maxBytesReached = true;
-        break;
-      }
-    }
+    const rendered = renderEntries(selectedEntries, lineEndingStyle);
 
     return this.finishReadResult({
-      renderedLines,
-      truncatedLineNumbers,
+      renderedLines: rendered.renderedLines,
+      truncatedLineNumbers: rendered.truncatedLineNumbers,
       maxLinesReached,
-      maxBytesReached,
+      maxBytesReached: rendered.maxBytesReached,
       lineEndingStyle,
-      startLine: renderedLines.length > 0 ? lineOffset : 0,
+      startLine: selectedEntries.length > 0 ? lineOffset : 0,
       totalLines: currentLineNo,
       requestedLines,
     });
@@ -335,6 +417,33 @@ export class ReadTool implements BuiltinTool<ReadInput> {
     requestedLines: number,
   ): Promise<ExecutableToolResult> {
     const tailCount = Math.abs(lineOffset);
+    const rangeKaos = this.kaos as RangeReadKaos;
+    if (rangeKaos.scanTextFile !== undefined && rangeKaos.readTailLines !== undefined) {
+      const scan = await rangeKaos.scanTextFile(safePath);
+      if (scan.hasNul) {
+        return { isError: true, output: notReadableFileOutput(displayPath) };
+      }
+      const rawLines: string[] = [];
+      for await (const rawLine of rangeKaos.readTailLines(safePath, {
+        tailCount,
+        errors: 'strict',
+      })) {
+        rawLines.push(rawLine);
+      }
+      const startLine = Math.max(1, scan.totalLines - rawLines.length + 1);
+      const entries = rawLines.map((rawLine, index) => ({
+        lineNo: startLine + index,
+        rawContent: stripTrailingLf(rawLine),
+      }));
+      return this.finishTailEntries({
+        entries,
+        lineEndingFlags: scan.lineEndingFlags,
+        effectiveLimit,
+        totalLines: scan.totalLines,
+        requestedLines,
+      });
+    }
+
     const entries: ReadLineEntry[] = [];
     const flags: LineEndingFlags = { hasCrLf: false, hasLf: false, hasLoneCr: false };
     let currentLineNo = 0;
@@ -354,8 +463,24 @@ export class ReadTool implements BuiltinTool<ReadInput> {
       }
     }
 
-    const lineEndingStyle = lineEndingStyleFromFlags(flags);
-    let renderedCandidates = entries.slice(0, effectiveLimit).map((entry) => {
+    return this.finishTailEntries({
+      entries,
+      lineEndingFlags: flags,
+      effectiveLimit,
+      totalLines: currentLineNo,
+      requestedLines,
+    });
+  }
+
+  private finishTailEntries(input: {
+    entries: readonly ReadLineEntry[];
+    lineEndingFlags: LineEndingFlags;
+    effectiveLimit: number;
+    totalLines: number;
+    requestedLines: number;
+  }): ExecutableToolResult {
+    const lineEndingStyle = lineEndingStyleFromFlags(input.lineEndingFlags);
+    let renderedCandidates = input.entries.slice(0, input.effectiveLimit).map((entry) => {
       return { entry, rendered: renderLine(entry, lineEndingStyle) };
     });
 
@@ -396,21 +521,19 @@ export class ReadTool implements BuiltinTool<ReadInput> {
       maxBytesReached,
       lineEndingStyle,
       startLine: renderedCandidates[0]?.entry.lineNo ?? 0,
-      totalLines: currentLineNo,
-      requestedLines,
+      totalLines: input.totalLines,
+      requestedLines: input.requestedLines,
     });
   }
 
   private finishReadResult(input: FinishReadResultInput): ExecutableToolResult {
+    // The status line rides the `note` side channel (model-only); `output` is
+    // the rendered file content and nothing else. The `<system>` wrapping is
+    // this tool's wording choice.
     return {
-      output: this.finishOutput(input.renderedLines, this.finishMessage(input)),
+      output: input.renderedLines.join('\n'),
+      note: `<system>${this.finishMessage(input)}</system>`,
     };
-  }
-
-  private finishOutput(renderedLines: readonly string[], message: string): string {
-    const rendered = renderedLines.join('\n');
-    const status = `<system>${message}</system>`;
-    return rendered.length > 0 ? `${rendered}\n${status}` : status;
   }
 
   private finishMessage(input: FinishReadResultInput): string {

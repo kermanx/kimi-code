@@ -5,11 +5,16 @@
  * separate from the TUI orchestration layer.
  */
 
-import type { ModelAlias, PermissionMode, SessionStatus } from '@moonshot-ai/kimi-code-sdk';
-import chalk from 'chalk';
+import {
+  effectiveModelAlias,
+  type ModelAlias,
+  type PermissionMode,
+  type SessionStatus,
+  type ThinkingEffort,
+} from '@moonshot-ai/kimi-code-sdk';
 
 import { PRODUCT_NAME } from '#/constant/app';
-import type { ColorPalette } from '#/tui/theme/colors';
+import { currentTheme } from '#/tui/theme';
 import {
   formatTokenCount,
   ratioSeverity,
@@ -17,7 +22,11 @@ import {
   safeUsageRatio,
 } from '#/utils/usage/usage-format';
 
-import { buildManagedUsageReportLines, type ManagedUsageReport } from './usage-panel';
+import {
+  buildExtraUsageSection,
+  buildManagedUsageReportLines,
+  type ManagedUsageReport,
+} from './usage-panel';
 
 interface FieldRow {
   readonly label: string;
@@ -26,13 +35,12 @@ interface FieldRow {
 }
 
 export interface StatusReportOptions {
-  readonly colors: ColorPalette;
   readonly version: string;
   readonly model: string;
   readonly workDir: string;
   readonly sessionId: string;
   readonly sessionTitle: string | null;
-  readonly thinking: boolean;
+  readonly thinkingEffort: ThinkingEffort;
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;
   readonly contextUsage: number;
@@ -49,17 +57,16 @@ type Colorize = (text: string) => string;
 
 function displayModelName(alias: string, models: Record<string, ModelAlias>): string {
   const model = models[alias];
-  return model?.displayName ?? model?.model ?? alias;
+  const effective = model === undefined ? undefined : effectiveModelAlias(model);
+  return effective?.displayName ?? effective?.model ?? alias;
 }
 
 function formatModelStatus(options: StatusReportOptions): string {
   const model = options.status?.model ?? options.model;
   if (model.trim().length === 0) return 'not set';
 
-  const thinking = (options.status?.thinkingLevel ?? (options.thinking ? 'on' : 'off')) === 'off'
-    ? 'off'
-    : 'on';
-  return `${displayModelName(model, options.availableModels)} (thinking ${thinking})`;
+  const effort = options.status?.thinkingEffort ?? options.thinkingEffort;
+  return `${displayModelName(model, options.availableModels)} (thinking ${effort})`;
 }
 
 function addFieldRows(
@@ -89,13 +96,12 @@ function contextValues(options: StatusReportOptions): {
 }
 
 export function buildStatusReportLines(options: StatusReportOptions): string[] {
-  const colors = options.colors;
-  const accent = chalk.hex(colors.primary).bold;
-  const value = chalk.hex(colors.text);
-  const muted = chalk.hex(colors.textDim);
-  const errorStyle = chalk.hex(colors.error);
-  const severityHex = (sev: 'ok' | 'warn' | 'danger'): string =>
-    sev === 'danger' ? colors.error : sev === 'warn' ? colors.warning : colors.success;
+  const accent = (text: string) => currentTheme.boldFg('primary', text);
+  const value = (text: string) => currentTheme.fg('text', text);
+  const muted = (text: string) => currentTheme.fg('textDim', text);
+  const errorStyle = (text: string) => currentTheme.fg('error', text);
+  const severityToken = (sev: 'ok' | 'warn' | 'danger'): 'error' | 'warning' | 'success' =>
+    sev === 'danger' ? 'error' : sev === 'warn' ? 'warning' : 'success';
 
   const permission = options.status?.permission ?? options.permissionMode;
   const planMode = options.status?.planMode ?? options.planMode;
@@ -125,7 +131,7 @@ export function buildStatusReportLines(options: StatusReportOptions): string[] {
   if (maxTokens > 0) {
     const safeRatio = safeUsageRatio(ratio);
     const bar = renderProgressBar(safeRatio, 20);
-    const barColoured = chalk.hex(severityHex(ratioSeverity(safeRatio)))(bar);
+    const barColoured = currentTheme.fg(severityToken(ratioSeverity(safeRatio)), bar);
     lines.push(
       `  ${barColoured}  ${value(`${(safeRatio * 100).toFixed(1)}%`.padStart(6, ' '))}  ` +
         muted(`(${formatTokenCount(tokens)} / ${formatTokenCount(maxTokens)})`),
@@ -135,13 +141,23 @@ export function buildStatusReportLines(options: StatusReportOptions): string[] {
   }
 
   const managedSection = buildManagedUsageReportLines({
-    colors,
     managedUsage: options.managedUsage,
     managedUsageError: options.managedUsageError,
   });
   if (managedSection.length > 0) {
     lines.push('');
     lines.push(...managedSection);
+  }
+
+  const extraSection = buildExtraUsageSection(
+    options.managedUsage?.extraUsage,
+    accent,
+    value,
+    muted,
+  );
+  if (extraSection.length > 0) {
+    lines.push('');
+    lines.push(...extraSection);
   }
 
   return lines;

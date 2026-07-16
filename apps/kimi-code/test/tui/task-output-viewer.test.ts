@@ -1,4 +1,4 @@
-import type { Terminal } from '@earendil-works/pi-tui';
+import type { Terminal } from '@moonshot-ai/pi-tui';
 import type { BackgroundTaskInfo } from '@moonshot-ai/kimi-code-sdk';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -39,6 +39,7 @@ function fakeTerminal(rows: number, columns = 120): Terminal {
 function info(overrides: Partial<BackgroundTaskInfo> = {}): BackgroundTaskInfo {
   return {
     taskId: 'bash-aaaaaaaa',
+    kind: 'process',
     command: 'npm run dev',
     description: 'dev server',
     status: 'running',
@@ -47,7 +48,7 @@ function info(overrides: Partial<BackgroundTaskInfo> = {}): BackgroundTaskInfo {
     startedAt: Date.now() - 60_000,
     endedAt: null,
     ...overrides,
-  };
+  } as BackgroundTaskInfo;
 }
 
 function makeViewer(opts: {
@@ -62,7 +63,6 @@ function makeViewer(opts: {
       taskId: opts.taskInfo?.taskId ?? 'bash-aaaaaaaa',
       info: opts.taskInfo ?? info(),
       output: opts.output,
-      colors: darkColors,
       onClose: opts.onClose ?? (() => {}),
     },
     fakeTerminal(opts.rows ?? 30, opts.columns ?? 120),
@@ -144,6 +144,24 @@ describe('TaskOutputViewer — scrolling', () => {
     expect(out).not.toContain('line-001');
   });
 
+  it('Ctrl+D scrolls a page down', () => {
+    const viewer = makeViewer({ output: bigOutput(50), rows: 12 });
+    viewer.handleInput('\u0004'); // Ctrl+D
+    const out = strip(viewer.render(120).join('\n'));
+    // Same page size as PageDown: body has 8 viewable rows, page = 7 lines.
+    expect(out).toContain('line-008');
+    expect(out).not.toContain('line-001');
+  });
+
+  it('Ctrl+U scrolls a page up', () => {
+    const viewer = makeViewer({ output: bigOutput(50), rows: 12 });
+    viewer.handleInput('G'); // jump to bottom first
+    viewer.handleInput('\u0015'); // Ctrl+U
+    const out = strip(viewer.render(120).join('\n'));
+    expect(out).toContain('line-036');
+    expect(out).not.toContain('line-050');
+  });
+
   it('G jumps to the bottom', () => {
     const viewer = makeViewer({ output: bigOutput(100), rows: 14 });
     viewer.handleInput('G');
@@ -218,7 +236,6 @@ describe('TaskOutputViewer — live tail via setProps', () => {
       taskId: 'bash-aaaaaaaa',
       info: info(),
       output: makeOutput(50),
-      colors: darkColors,
       onClose: () => {},
     });
     const out = strip(viewer.render(120).join('\n'));
@@ -234,7 +251,6 @@ describe('TaskOutputViewer — live tail via setProps', () => {
       taskId: 'bash-aaaaaaaa',
       info: info(),
       output: makeOutput(200),
-      colors: darkColors,
       onClose: () => {},
     });
     const out = strip(viewer.render(120).join('\n'));
@@ -251,7 +267,6 @@ describe('TaskOutputViewer — live tail via setProps', () => {
       taskId: 'bash-aaaaaaaa',
       info: info(),
       output: same,
-      colors: darkColors,
       onClose: () => {},
     });
     const after = strip(viewer.render(120).join('\n'));

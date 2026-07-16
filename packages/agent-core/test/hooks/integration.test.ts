@@ -1,6 +1,6 @@
 import { mkdtempSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join } from 'pathe';
 
 import type { ContentPart } from '@moonshot-ai/kosong';
 import { describe, expect, it } from 'vitest';
@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 // Dynamic-import contract: locks the Agent <-> HookEngine integration shape
 // (engine ctor, trigger surface, summary, wire callbacks, event helpers,
 // config round-trip) before the implementation lands.
-const ENGINE_MODULE = '../../src/agent/hooks/engine' as string;
+const ENGINE_MODULE = '../../src/session/hooks/engine' as string;
 const CONFIG_MODULE = '../../src/config' as string;
 
 type HookDef = {
@@ -60,24 +60,21 @@ async function importEngine(): Promise<HookEngineCtor> {
 describe('HookEngine integration', () => {
   it('blocks a dangerous Shell command and allows a safe one via a PreToolUse script hook', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'kimi-hooks-int-'));
-    const script = join(dir, 'block-rm.sh');
-    // Use node for the body to keep the test runtime-agnostic.
+    const script = join(dir, 'block-rm.cjs');
+    // Node script body (avoids bash-only syntax so the test runs on Windows).
     writeFileSync(
       script,
       [
-        '#!/bin/bash',
-        'CMD=$(node -e "let s=\\"\\";process.stdin.on(\\"data\\",d=>s+=d);process.stdin.on(\\"end\\",()=>{try{const o=JSON.parse(s);process.stdout.write((o.tool_input&&o.tool_input.command)||\\"\\");}catch(e){}})")',
-        'if echo "$CMD" | grep -q "rm -rf"; then echo "Blocked: rm -rf" >&2; exit 2; fi',
-        'exit 0',
-        '',
+        "let s='';",
+        "process.stdin.on('data',d=>s+=d);",
+        "process.stdin.on('end',()=>{try{const o=JSON.parse(s);const c=(o.tool_input&&o.tool_input.command)||'';if(/rm -rf/.test(c)){process.stderr.write('Blocked: rm -rf');process.exit(2);}process.exit(0);}catch(e){}});",
       ].join('\n'),
       'utf-8',
     );
-    chmodSync(script, 0o755);
 
     const HookEngine = await importEngine();
     const engine = new HookEngine(
-      [{ event: 'PreToolUse', matcher: 'Shell', command: script, timeout: 5 }],
+      [{ event: 'PreToolUse', matcher: 'Shell', command: `${process.execPath} ${script}`, timeout: 5 }],
       { cwd: dir },
     );
 
@@ -101,7 +98,7 @@ describe('HookEngine integration', () => {
       {
         event: 'Stop',
         command:
-          'echo \'{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"tests not written"}}\'',
+          "node -e \"process.stdout.write(JSON.stringify({hookSpecificOutput:{permissionDecision:'deny',permissionDecisionReason:'tests not written'}}))\"",
         timeout: 5,
       },
     ]);
@@ -223,7 +220,7 @@ timeout = 5
     const engine = new HookEngine([
       {
         event: 'UserPromptSubmit',
-        command: "echo 'no profanity' >&2; exit 2",
+        command: "node -e \"process.stderr.write('no profanity');process.exit(2)\"",
         timeout: 5,
       },
     ]);

@@ -17,12 +17,14 @@ import { z } from 'zod';
 
 import type { Agent } from '../../../agent';
 import type { SkillActivationOrigin } from '../../../agent/context';
+import { renderModelToolSkillPrompt } from '../../../agent/skill/prompt';
 import type { BuiltinTool } from '../../../agent/tool';
 import type { ExecutableToolResult, ToolExecution } from '../../../loop/types';
 import { isInlineSkillType, type SkillDefinition } from '../../../skill';
 import { renderPrompt } from '../../../utils/render-prompt';
 import { toInputJsonSchema } from '../../support/input-schema';
-import skillDescriptionTemplate from './skill-tool.md';
+import { matchesGlobRuleSubject } from '../../support/rule-match';
+import skillDescriptionTemplate from './skill-tool.md?raw';
 
 export const MAX_SKILL_QUERY_DEPTH = 3;
 
@@ -47,8 +49,17 @@ export interface SkillToolInput {
 }
 
 export const SkillToolInputSchema: z.ZodType<SkillToolInput> = z.object({
-  skill: z.string(),
-  args: z.string().optional(),
+  skill: z
+    .string()
+    .describe(
+      'The exact name of the skill to invoke, spelled as it appears in the current skill listing (e.g. "commit", "pdf").',
+    ),
+  args: z
+    .string()
+    .optional()
+    .describe(
+      'Optional argument string for the skill, written like a command line (e.g. `-m "fix bug"`, `123`, a file path). It is split on whitespace (quotes group a token) and expanded into the skill\'s placeholders ($NAME, $1, $ARGUMENTS); if the skill body has no placeholders, the whole string is still appended as a trailing `ARGUMENTS:` line. Omit it only when there is nothing to pass.',
+    ),
 });
 
 export interface SkillToolOptions {
@@ -65,9 +76,7 @@ export interface SkillToolOptions {
 
 export class SkillTool implements BuiltinTool<SkillToolInput> {
   readonly name = 'Skill';
-  readonly description: string = renderPrompt(skillDescriptionTemplate, {
-    MAX_SKILL_QUERY_DEPTH,
-  });
+  readonly description: string = renderPrompt(skillDescriptionTemplate, {});
   readonly parameters: Record<string, unknown> = toInputJsonSchema(SkillToolInputSchema);
 
   constructor(
@@ -78,6 +87,9 @@ export class SkillTool implements BuiltinTool<SkillToolInput> {
   resolveExecution(args: SkillToolInput): ToolExecution {
     return {
       description: `Invoke skill ${args.skill}`,
+      display: { kind: 'skill_call', skill_name: args.skill, args: args.args },
+      approvalRule: this.name,
+      matchesRule: (ruleArgs) => matchesGlobRuleSubject(ruleArgs, args.skill),
       execute: () => this.execution(args),
     };
   }
@@ -101,7 +113,7 @@ export class SkillTool implements BuiltinTool<SkillToolInput> {
     }
 
     const skills = this.agent.skills;
-    if (skills === undefined) {
+    if (skills === null) {
       return errorResult(`Skill "${args.skill}" not found in the current skill listing.`);
     }
     const skill = skills.registry.getSkill(args.skill);
@@ -124,12 +136,23 @@ export class SkillTool implements BuiltinTool<SkillToolInput> {
     }
 
     const origin = skillOrigin(skill, skillArgs, currentDepth);
+    const promptTrigger = origin.trigger === 'nested-skill' ? 'nested-skill' : 'model-tool';
     skills.recordActivation(origin);
     const skillContent = skills.registry.renderSkillPrompt(skill, skillArgs);
-    this.agent.context.appendSystemReminder(
-      `<kimi-skill-loaded name="${escapeXml(skill.name)}" args="${escapeXml(skillArgs)}">\n` +
-        `${skillContent}\n` +
-        `</kimi-skill-loaded>`,
+    this.agent.context.appendUserMessage(
+      [
+        {
+          type: 'text' as const,
+          text: renderModelToolSkillPrompt({
+            skillName: skill.name,
+            skillArgs,
+            skillContent,
+            skillSource: skill.source,
+            skillDir: skill.dir,
+            trigger: promptTrigger,
+          }),
+        },
+      ],
       origin,
     );
     return {
@@ -157,12 +180,4 @@ function skillOrigin(
     skillPath: skill.path,
     skillSource: skill.source,
   };
-}
-
-function escapeXml(input: string): string {
-  return input
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;');
 }

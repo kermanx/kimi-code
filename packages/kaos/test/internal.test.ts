@@ -95,6 +95,15 @@ describe('BufferedReadable', () => {
     expect(received).toBe(boom);
     expect(buffered.destroyed).toBe(true);
   });
+
+  it('destroys the underlying source when the wrapper is destroyed', () => {
+    const source = new PassThrough();
+    const buffered = new BufferedReadable(source);
+
+    buffered.destroy();
+
+    expect(source.destroyed).toBe(true);
+  });
 });
 
 describe('decodeTextWithErrors', () => {
@@ -188,6 +197,23 @@ describe('globPatternToRegex additional cases', () => {
     expect(regex.test('a+b.c$d(e)')).toBe(true);
     // Without escaping, `+` would make `ab` match via one-or-more repetition.
     expect(regex.test('ab.c$d(e)')).toBe(false);
+  });
+
+  it('treats backslash as an escape character for the next literal', () => {
+    // `\[` and `\]` should match literal brackets in the filename.
+    const regex = globPatternToRegex('special \\[bracket\\].ts', true);
+    expect(regex.test('special [bracket].ts')).toBe(true);
+    expect(regex.test('special bracket.ts')).toBe(false);
+  });
+
+  it('escapes backslashes inside character classes to avoid an unterminated regex', () => {
+    // A trailing backslash inside a glob char class (`[abc\\]`) would
+    // escape the closing `]` in the resulting regex. We escape it so the
+    // regex stays valid and the backslash is treated as a literal member.
+    const regex = globPatternToRegex('file[abc\\].txt', true);
+    expect(regex.test('filea.txt')).toBe(true);
+    expect(regex.test('file\\.txt')).toBe(true);
+    expect(regex.test('filez.txt')).toBe(false);
   });
 });
 

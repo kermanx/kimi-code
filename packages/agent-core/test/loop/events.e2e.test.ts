@@ -9,7 +9,7 @@ import type { LoopEvent, LoopLiveEventEmitter } from '../../src/loop/index';
 import { CollectingSink } from './fixtures/collecting-sink';
 import { makeEndTurnResponse, makeToolCall, makeToolUseResponse } from './fixtures/fake-llm';
 import { runTurn } from './fixtures/helpers';
-import { EchoTool, markReadAnyFileAccesses, ProgressTool } from './fixtures/tools';
+import { EchoTool, markReadFileAccesses, ProgressTool } from './fixtures/tools';
 
 describe('runTurn — LoopEventDispatcher live event containment', () => {
   it('contains synchronous emit() throws', async () => {
@@ -98,8 +98,8 @@ describe('runTurn — LoopEventDispatcher live event containment', () => {
   });
 
   it('emits a documented full event sequence for one tool-bearing turn', async () => {
-    const echo = markReadAnyFileAccesses(new EchoTool());
-    const progress = markReadAnyFileAccesses(
+    const echo = markReadFileAccesses(new EchoTool());
+    const progress = markReadFileAccesses(
       new ProgressTool([{ kind: 'progress', percent: 50 }]),
     );
     const { sink } = await runTurn({
@@ -156,6 +156,19 @@ describe('runTurn — LoopEventDispatcher live event containment', () => {
     const tr = sink.byType('tool.result')[0];
     expect(tr?.toolCallId).toBe('tc-99');
     expect(typeof tr?.result.output).toBe('string');
+  });
+
+  it('records the provider response id on step.end', async () => {
+    const { context } = await runTurn({
+      responses: [
+        {
+          ...makeEndTurnResponse('ok'),
+          messageId: 'chatcmpl-test',
+        },
+      ],
+    });
+
+    expect(context.stepEnds()[0]?.messageId).toBe('chatcmpl-test');
   });
 
   it('accepts a custom emitter function', async () => {

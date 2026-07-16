@@ -1,46 +1,62 @@
 # Hooks
 
-Hooks 让你在 Kimi Code CLI 的关键生命周期点运行本地命令。它适合做轻量的策略检查、审计记录、桌面通知或与本地自动化脚本联动，例如在危险工具调用前拦截，或在后台子 Agent 完成后触发通知。
+Hooks（钩子）是一种自动触发机制：你预先告诉 Kimi Code CLI"每当发生 X，运行这个脚本"。脚本在你的本机执行，你可以在里面写任何逻辑。典型的使用场景：
 
-Hook 命令在本地 Shell 中运行，Kimi Code CLI 会把事件 payload 以 JSON 写入命令的 stdin。命令的 stdout、stderr 和退出码决定 hook 的结果；除明确阻断的情况外，hook 失败时默认放行（fail-open），不会让主流程因为脚本异常而中断。
+- **安全拦截**：Agent 要执行 Shell 命令前，检查是否包含危险操作（如 `rm -rf`），包含则阻断执行
+- **桌面通知**：后台任务完成时，弹出系统通知提醒你回来查看结果
+- **自动检查**：每次用户提交消息时，自动在上下文里附加一些背景信息（如当前 Git 分支）
+
+## Hooks 是怎么工作的
+
+配置一条 hook 规则，需要指定三件事：**在什么事件上触发**、**匹配哪些目标**、**运行哪个脚本**。
+
+触发时，CLI 会把事件的详细信息（触发原因、工具名称、命令内容等）打包成 JSON（一种结构化文本格式），通过**标准输入**（stdin，程序运行时用来接收外部数据的通道）传给你的脚本。脚本读取这些信息后，决定怎么响应。
+
+脚本的响应结果由两样东西决定：
+
+- **退出码**（exit code，程序结束时向操作系统报告的状态数字）：`0` 表示放行，`2` 表示阻断，其他数字默认放行
+- **标准输出**（stdout，就是你用 `console.log` 或 `print` 打印出来的内容）：可以附带说明文字
+
+即使脚本报错、超时，CLI 也**不会因此中断你的工作**——这种"出错就放行"的设计叫 fail-open（失败开放），避免 hook 异常变成绊脚石。
 
 ::: warning 注意
-Hooks 适合做本地提醒和轻量拦截，不应作为唯一安全边界。脚本报错、超时或返回普通非零退出码时会默认放行（fail-open）；高风险工具调用仍应依赖权限审批和人工确认。
+正因为 fail-open，Hooks 适合做提醒和轻量拦截，但**不应作为唯一的安全防线**。对真正高风险的操作，仍需依赖权限审批和人工确认。
 :::
+
+## 快速上手：一个最简单的 hook
+
+下面这条 hook 会在每次后台任务完成时，在终端标题栏闪一下通知（macOS 需要安装 `terminal-notifier`）：
+
+```toml
+# 写在 ~/.kimi-code/config.toml 里
+[[hooks]]
+event = "Notification"           # 触发时机：后台任务状态变化时
+matcher = "task\\.completed"     # 只关心"已完成"的通知
+command = "terminal-notifier -title Kimi -message 'Task done'"
+```
+
+保存配置、重开会话，下次后台任务完成时就会弹出通知。
 
 ## 配置
 
-在 `~/.kimi-code/config.toml` 中使用 `[[hooks]]` 数组表声明 hook：
-
-```toml
-[[hooks]]
-event = "PreToolUse"
-matcher = "Bash"
-command = "node ~/.kimi-code/hooks/check-bash.mjs"
-timeout = 5
-
-[[hooks]]
-event = "Notification"
-matcher = "task\\.completed"
-command = "terminal-notifier -title Kimi -message 'Background task finished'"
-```
-
-字段含义如下：
+所有 hook 规则写在 `~/.kimi-code/config.toml` 的 `[[hooks]]` 数组里，每一项是一条规则：
 
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `event` | `string` | 是 | 事件名，取值必须是下文「事件」表中的某一项；其他值会让整份配置加载失败 |
-| `matcher` | `string` | 否 | 用于匹配事件目标的正则表达式；缺省或空字符串表示匹配全部 |
-| `command` | `string` | 是 | 要运行的 Shell 命令，长度不能为零 |
-| `timeout` | `integer` | 否 | 超时时间，单位秒，范围 1–600；未设置时默认为 30 秒 |
+| `event` | `string` | 是 | 触发事件名，必须是下文「事件一览」表中的某一项 |
+| `matcher` | `string` | 否 | 用正则表达式（一种字符串匹配语法）过滤事件目标；不填则匹配全部 |
+| `command` | `string` | 是 | 触发时要运行的 Shell 命令 |
+| `timeout` | `integer` | 否 | 超时秒数，范围 1–600；默认 30 秒 |
 
-每个 `[[hooks]]` 表只允许出现这四个字段，写错或多写字段会导致配置文件解析失败。
+`[[hooks]]` 只允许这四个字段，多写会导致配置文件加载失败。
 
-同一次事件触发时，命中的多个 hook 会并行运行；如果多个配置项的 `command` 完全相同，只会运行一次。`matcher` 使用 JavaScript 正则表达式语义；非法正则会被静默跳过，等同于不匹配。
+**同一事件匹配多条规则时**，所有命中的 hook 并行运行；`command` 完全相同的多条规则只运行一次。
 
-Hook 命令通过 Shell 启动（等价于 `sh -c <command>`），子进程的工作目录就是当前会话的 `cwd`。在非 Windows 平台上，子进程会被放入独立的进程组，超时或会话被中断时会先发送 `SIGTERM`、100 毫秒后再发送 `SIGKILL`，确保 hook 内部 fork 出的子进程也能被一并清理。
+Hook 命令的工作目录是当前会话的项目目录。非 Windows 平台上，hook 进程放在独立进程组里，超时时先发信号让它有机会善后，之后才强制终止。
 
-传给 hook 的 JSON 字段统一使用 snake_case。每个 payload 都包含：
+### 事件数据格式
+
+每次触发时，CLI 都会把以下基础信息通过 stdin 传给脚本：
 
 ```json
 {
@@ -50,79 +66,58 @@ Hook 命令通过 Shell 启动（等价于 `sh -c <command>`），子进程的�
 }
 ```
 
-其余字段由事件类型决定，见下文事件表。
+具体事件还会附带额外字段（如工具名称、命令内容），见下方事件一览。所有字段名使用下划线命名（snake_case）。
 
 ## 返回值
 
-Hook 命令的退出码和 stdout 会被解释为以下结果：
+脚本结束后，CLI 根据退出码判断 hook 的意图：
 
-| 结果 | 行为 |
-| --- | --- |
-| 退出码 `0` | 放行；如果 stdout 是 JSON，可从 `message` 或 `hookSpecificOutput.message` 读取文本 |
-| 退出码 `2` | 阻断；stderr 会作为阻断原因 |
-| 其他非零退出码 | 默认放行（fail-open） |
-| 超时或进程异常 | 默认放行（fail-open） |
+| 退出码 | 含义 | CLI 怎么处理 |
+| --- | --- | --- |
+| `0` | 正常结束，放行 | 继续执行，若标准输出（stdout）有内容可附加到上下文 |
+| `2` | 主动阻断 | 停止当前操作；错误输出（stderr，`console.error` 打印的内容）作为阻断原因 |
+| 其他非零值 | 脚本出错 | 默认放行（fail-open） |
+| 超时或崩溃 | 脚本异常 | 默认放行（fail-open） |
 
-当 stdout 是 JSON，并且 `hookSpecificOutput.permissionDecision` 为 `deny` 时，也会被视为阻断：
+也可以通过标准输出返回一段 JSON 来阻断：
 
 ```json
 {
   "hookSpecificOutput": {
     "permissionDecision": "deny",
-    "permissionDecisionReason": "Use rg instead"
+    "permissionDecisionReason": "请用 rg 代替 grep"
   }
 }
 ```
 
-阻断只对支持控制流的事件生效。例如 `PreToolUse` 可以阻断工具调用，`Stop` 可以让当前轮次追加一次继续消息。观察型事件（例如 `PostToolUse`、`PostToolUseFailure`、`PostCompact`、`SubagentStop`、`StopFailure`、`Notification`）以「即发即忘（fire-and-forget）」方式异步触发，返回值被忽略，不会改变主流程。`PreCompact` 使用 `trigger`（而非 `triggerBlock`）调用，返回值同样被完全忽略，不属于可阻断事件。
+::: info 哪些事件支持阻断？
+只有**可阻断事件**（`PreToolUse`、`Stop`、`UserPromptSubmit`）的返回值会影响主流程。其余事件属于**观察型事件**——触发后即发即忘，不管脚本返回什么，主流程都不会改变。
+:::
 
-阻断生效时，如果脚本未通过 stderr 或 JSON 输出提供原因，CLI 会回退到 `Blocked by <event> hook` 作为占位原因。`PreToolUse` 阻断会作为工具失败结果写回上下文，模型可以根据原因选择替代方案。
+## 事件一览
 
-## 事件
-
-当前会自动触发的事件如下：
-
-| 事件 | Matcher | 主要 payload | 行为 |
+| 事件 | Matcher 匹配的是 | 会触发阻断？ | 说明 |
 | --- | --- | --- | --- |
-| `UserPromptSubmit` | 用户提交的文本内容 | `prompt`（`ContentPart[]` 数组） | 仅对真实 User 消息触发。hook 返回的文本会包裹为 hook 结果，写入会话历史用于 transcript/replay，并展示给用户；当前 LLM 轮次会继续，但不会把 hook 结果发给模型；若 hook 阻断，阻断原因会作为 Assistant 消息返回给用户，且不再调用模型；若所有 hook 均无输出，正常 LLM 轮次继续 |
-| `PreToolUse` | 工具名 | `tool_name`、`tool_input`、`tool_call_id` | 在权限检查前触发；阻断后工具不会执行 |
-| `PostToolUse` | 工具名 | `tool_name`、`tool_input`、`tool_call_id`、`tool_output` | 工具成功后触发；`tool_output` 被截断至前 2000 个字符 |
-| `PostToolUseFailure` | 工具名 | `tool_name`、`tool_input`、`tool_call_id`、`error` | 工具失败或被 hook 阻断后触发 |
-| `Stop` | 空字符串 | `stop_hook_active` | 模型准备停止时触发；阻断后会把原因直接作为系统触发的 User 消息追加进上下文，并最多继续一次 |
-| `StopFailure` | 错误类型 | `error_type`、`error_message` | 当前轮次因非取消错误失败后触发 |
-| `SessionStart` | `startup` 或 `resume` | `source` | 新会话主 Agent 创建后，或历史会话恢复完成后触发 |
-| `SessionEnd` | `exit` | `reason` | 会话关闭并 flush 元数据后触发 |
-| `SubagentStart` | 子 Agent 名称 | `agent_name`、`prompt` | 子 Agent 配置完成、真正开始运行前触发；`prompt` 被截断至前 500 个字符 |
-| `SubagentStop` | 子 Agent 名称 | `agent_name`、`response` | 子 Agent 成功完成后异步触发，失败时不触发；`response` 被截断至前 500 个字符 |
-| `PreCompact` | `manual` 或 `auto` | `trigger`、`token_count` | 上下文压缩真正开始前触发；此事件使用 `trigger`（非 `triggerBlock`）调用，返回值被完全忽略，阻断决策不会被读取 |
-| `PostCompact` | `manual` 或 `auto` | `trigger`、`estimated_token_count` | 上下文压缩成功写入后异步触发；阻断结果不会改变主流程 |
-| `Notification` | 通知类型 | `sink`、`notification_type`、`title`、`body`、`severity`、`source_kind`、`source_id` | 当前在后台子 Agent 结果写入上下文时触发；`notification_type` 取值为 `task.completed`、`task.failed`、`task.killed` 或 `task.lost`，sink 为 `context` |
-
-`UserPromptSubmit` 的返回文本会被包裹成一条 hook 结果：
-
-```xml
-<hook_result hook_event="UserPromptSubmit">
-hook response
-</hook_result>
-```
-
-如果多个 `UserPromptSubmit` hook 返回文本，每个结果都会拥有独立的 `<hook_result>` 标签。这条消息会带有 hook 结果来源，用于 transcript/replay，但不会发给模型。模型只看到原始用户输入，当前轮次继续。
-
-如果 `UserPromptSubmit` hook 阻断请求，阻断原因会使用同样格式返回给用户，但本轮不会继续请求模型。
-
-`Stop` 的阻断原因会直接作为系统触发的 User 消息写入上下文，让当前轮次继续：
-
-```text
-continue from hook
-```
+| `UserPromptSubmit` | 用户提交的文本内容 | ✓ | 用户发送消息时触发；返回文本会附加到上下文；若阻断，本轮不调用模型 |
+| `PreToolUse` | 工具名 | ✓ | 工具调用前触发（权限检查前）；阻断后工具不会执行 |
+| `Stop` | 空字符串 | ✓ | 模型准备结束本轮时触发；阻断后可追加一条消息让模型继续 |
+| `PostToolUse` | 工具名 | — | 工具成功执行后触发（观察用） |
+| `PostToolUseFailure` | 工具名 | — | 工具失败或被阻断后触发（观察用） |
+| `PermissionRequest` | 工具名 | — | 即将等待用户审批前触发（观察用） |
+| `PermissionResult` | 工具名 | — | 审批结束后触发（观察用） |
+| `SessionStart` | `startup` 或 `resume` | — | 新会话启动或历史会话恢复后触发 |
+| `SessionEnd` | `exit` | — | 会话关闭后触发 |
+| `SubagentStart` | 子 Agent 名称 | — | 子 Agent 开始运行前触发 |
+| `SubagentStop` | 子 Agent 名称 | — | 子 Agent 成功完成后触发（观察用） |
+| `StopFailure` | 错误类型 | — | 本轮因错误失败后触发（观察用） |
+| `Interrupt` | 空字符串 | — | 用户中断本轮时触发（例如按下 Esc）；超时或其他程序性中断不会触发。中断时 `Stop` 不会触发，由本事件替代。payload 含 `reason` 字段（观察用） |
+| `PreCompact` | `manual` 或 `auto` | — | 上下文压缩开始前触发；返回值被完全忽略 |
+| `PostCompact` | `manual` 或 `auto` | — | 上下文压缩完成后触发（观察用） |
+| `Notification` | 通知类型（如 `task.completed`） | — | 后台任务状态变化时触发（观察用） |
 
 ## 示例：阻断危险 Shell 命令
 
-下面的 hook 会在 `Bash` 工具调用前读取 stdin 中的 `tool_input.command`。如果命令包含 `rm -rf`，脚本以退出码 `2` 结束并把原因写到 stderr：
-
-::: warning 注意
-这个示例只演示 hook 如何阻断工具调用，不是完整的 Shell 安全解析器。真实策略更适合使用 allowlist，或用专门的 Shell 解析逻辑处理引号、变量展开、别名和多段命令。
-:::
+下面的 hook 在 Agent 调用 `Bash` 工具前检查命令内容，发现 `rm -rf` 就阻断：
 
 ```toml
 [[hooks]]
@@ -133,18 +128,30 @@ timeout = 5
 ```
 
 ```js
+// block-dangerous-bash.mjs
+// 从 stdin 读取 CLI 传来的事件数据
 let input = '';
-process.stdin.on('data', (chunk) => {
-  input += chunk;
-});
+process.stdin.on('data', (chunk) => { input += chunk; });
 process.stdin.on('end', () => {
-  const payload = JSON.parse(input);
+  const payload = JSON.parse(input);         // 解析事件数据
   const command = payload.tool_input?.command ?? '';
+
   if (command.includes('rm -rf')) {
-    console.error('Blocked dangerous shell command');
+    // 通过 stderr 说明阻断原因，退出码 2 表示阻断
+    console.error('检测到危险命令，已阻断');
     process.exit(2);
   }
+  // 正常退出（退出码 0）表示放行
 });
 ```
 
-当 hook 阻断工具调用时，Kimi Code CLI 会把阻断原因作为工具失败结果写回上下文，模型可以据此选择更安全的替代方案。
+阻断后，Kimi Code CLI 会把阻断原因写回上下文，模型可以据此选择更安全的替代方案。
+
+::: warning 注意
+此示例仅演示阻断机制，不是生产级的安全解析器。真实场景更适合用白名单，或用专门的 Shell 解析器处理引号、变量展开和多段命令。
+:::
+
+## 下一步
+
+- [配置文件](../configuration/config-files.md#hooks) — `[[hooks]]` 在 `config.toml` 中的完整字段声明
+- [Agent 与子 Agent](./agents.md) — 利用 `SubagentStop` 事件在子 Agent 完成后触发通知

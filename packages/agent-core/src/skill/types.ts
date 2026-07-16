@@ -6,6 +6,7 @@ export interface SkillMetadata {
   readonly type?: string | undefined;
   readonly whenToUse?: string | undefined;
   readonly disableModelInvocation?: boolean | undefined;
+  readonly isSubSkill?: boolean | undefined;
   readonly safe?: boolean | undefined;
   readonly arguments?: readonly unknown[] | string | undefined;
   readonly [key: string]: unknown;
@@ -19,6 +20,7 @@ export interface SkillDefinition {
   readonly content: string;
   readonly metadata: SkillMetadata;
   readonly source: SkillSource;
+  readonly plugin?: SkillPluginContext;
   readonly mermaid?: string | undefined;
   readonly d2?: string;
 }
@@ -30,11 +32,18 @@ export interface SkillSummary {
   readonly source: SkillSource;
   readonly type?: string | undefined;
   readonly disableModelInvocation?: boolean | undefined;
+  readonly isSubSkill?: boolean | undefined;
 }
 
 export interface SkillRoot {
   readonly path: string;
   readonly source: SkillSource;
+  readonly plugin?: SkillPluginContext;
+}
+
+export interface SkillPluginContext {
+  readonly id: string;
+  readonly instructions?: string;
 }
 
 export interface SkippedSkill {
@@ -62,7 +71,7 @@ export function isUserActivatableSkillType(type: string | undefined): boolean {
 }
 
 export function isSupportedSkillType(type: string | undefined): boolean {
-  return isUserActivatableSkillType(type);
+  return isUserActivatableSkillType(type) || type === 'reference';
 }
 
 export function summarizeSkill(skill: SkillDefinition): SkillSummary {
@@ -73,5 +82,6 @@ export function summarizeSkill(skill: SkillDefinition): SkillSummary {
     source: skill.source,
     type: skill.metadata.type,
     disableModelInvocation: skill.metadata.disableModelInvocation,
+    isSubSkill: skill.metadata.isSubSkill,
   };
 }

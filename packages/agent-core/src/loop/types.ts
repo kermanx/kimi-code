@@ -65,6 +65,12 @@ export interface ExecutableToolSuccessResult {
   readonly output: ExecutableToolOutput;
   readonly isError?: false | undefined;
   /**
+   * Internal loop-control hint. Tool result events strip this field before
+   * persistence; it only tells the current turn whether another model step or
+   * later tool calls in the same batch are allowed.
+   */
+  readonly stopTurn?: boolean | undefined;
+  /**
    * Optional human-readable side channel for tool-result metadata that
    * should not contaminate the data stream the model sees (e.g. a
    * "Task snapshot retrieved." brief for TaskOutput). Distinct from
@@ -72,6 +78,20 @@ export interface ExecutableToolSuccessResult {
    * this to the user.
    */
   readonly message?: string | undefined;
+  /**
+   * Optional side channel in the opposite direction of `message`: content
+   * that is rendered to the model but never to user-facing UIs. Routed
+   * verbatim — any formatting (tags, wording) is the producing tool's
+   * choice. Appended to the tool result as a trailing text part when the
+   * history is projected for the provider.
+   */
+  readonly note?: string | undefined;
+  /**
+   * True when the tool has already returned a partial result because it
+   * truncated, paged, or otherwise dropped original output. Later generic
+   * budgeting must not treat the visible output as complete source text.
+   */
+  readonly truncated?: boolean | undefined;
 }
 
 export interface ExecutableToolErrorResult {
@@ -79,12 +99,12 @@ export interface ExecutableToolErrorResult {
   readonly isError: true;
   /** See {@link ExecutableToolSuccessResult.message}. */
   readonly message?: string | undefined;
-  /**
-   * Internal loop-control hint. Tool result events strip this field before
-   * persistence; it only tells the current turn whether another model step is
-   * allowed after this tool batch.
-   */
+  /** See {@link ExecutableToolSuccessResult.note}. */
+  readonly note?: string | undefined;
+  /** See {@link ExecutableToolSuccessResult.stopTurn}. */
   readonly stopTurn?: boolean | undefined;
+  /** See {@link ExecutableToolSuccessResult.truncated}. */
+  readonly truncated?: boolean | undefined;
 }
 
 export type ExecutableToolResult = ExecutableToolSuccessResult | ExecutableToolErrorResult;
@@ -105,9 +125,16 @@ export interface ToolUpdate {
 export interface ExecutableToolContext {
   readonly turnId: string;
   readonly toolCallId: string;
+  readonly traceId?: string;
   readonly metadata?: unknown;
   readonly signal: AbortSignal;
   readonly onUpdate?: ((update: ToolUpdate) => void) | undefined;
+  /**
+   * Fired once when a foreground (non-background) process task is registered,
+   * carrying its task id. Used by the `!` shell-command path so the TUI can
+   * later detach (ctrl+b) that exact task. Background runs skip it.
+   */
+  readonly onForegroundTaskStart?: ((taskId: string) => void) | undefined;
 }
 
 export interface RunnableToolExecution {
@@ -115,13 +142,20 @@ export interface RunnableToolExecution {
   readonly accesses?: ToolAccesses | undefined;
   readonly display?: ToolInputDisplay | undefined;
   readonly description?: string;
+  /**
+   * Stops scheduling later tool calls in the same provider batch. Use this only
+   * for tools whose successful action changes turn lifecycle state.
+   */
+  readonly stopBatchAfterThis?: boolean | undefined;
+  readonly approvalRule: string;
+  readonly matchesRule?: ((ruleArgs: string) => boolean) | undefined;
   readonly execute: (ctx: ExecutableToolContext) => Promise<ExecutableToolResult>;
 }
 
 export type ToolExecution = RunnableToolExecution | ExecutableToolErrorResult;
 
 export interface ExecutableTool<Input = unknown> extends Tool {
-  resolveExecution(input: Input): ToolExecution;
+  resolveExecution(input: Input): ToolExecution | Promise<ToolExecution>;
 }
 
 /**
@@ -137,17 +171,26 @@ export interface LoopStepHookContext {
 }
 
 export interface ToolExecutionHookContext extends LoopStepHookContext {
+  readonly traceId?: string;
   readonly toolCall: ToolCall;
+  readonly toolCalls: readonly ToolCall[];
   readonly tool?: ExecutableTool | undefined;
   readonly args: unknown;
 }
 
-export interface PrepareToolExecutionResult {
+export interface ResolvedToolExecutionHookContext extends ToolExecutionHookContext {
+  readonly execution: RunnableToolExecution;
+}
+
+export interface AuthorizeToolExecutionResult {
   readonly block?: boolean | undefined;
   readonly reason?: string | undefined;
-  readonly updatedArgs?: unknown;
   readonly syntheticResult?: ExecutableToolResult | undefined;
   readonly executionMetadata?: unknown;
+}
+
+export interface PrepareToolExecutionResult extends AuthorizeToolExecutionResult {
+  readonly updatedArgs?: unknown;
 }
 
 export interface FinalizeToolResultContext extends ToolExecutionHookContext {
@@ -169,17 +212,33 @@ export interface BeforeStepResult {
   readonly reason?: string | undefined;
 }
 
+export interface AfterStepResult {
+  readonly stopTurn?: boolean | undefined;
+}
+
+export interface RecordStepUsageResult {
+  /**
+   * Internal loop-control hint. Hosts can return this after recording usage
+   * when the completed model step has reached a hard runtime limit.
+   */
+  readonly stopTurn?: boolean | undefined;
+}
+
 export interface ShouldContinueAfterStopResult {
   readonly continue: boolean;
 }
 
 export type BeforeStepHook = (ctx: LoopStepHookContext) => Promise<BeforeStepResult | undefined>;
 
-export type AfterStepHook = (ctx: LoopAfterStepContext) => Promise<void>;
+export type AfterStepHook = (ctx: LoopAfterStepContext) => Promise<AfterStepResult | void>;
 
 export type PrepareToolExecutionHook = (
   ctx: ToolExecutionHookContext,
 ) => Promise<PrepareToolExecutionResult | undefined>;
+
+export type AuthorizeToolExecutionHook = (
+  ctx: ResolvedToolExecutionHookContext,
+) => Promise<AuthorizeToolExecutionResult | undefined>;
 
 export type FinalizeToolResultHook = (
   ctx: FinalizeToolResultContext,
@@ -203,6 +262,7 @@ export interface LoopHooks {
   beforeStep?: BeforeStepHook | undefined;
   afterStep?: AfterStepHook | undefined;
   prepareToolExecution?: PrepareToolExecutionHook | undefined;
+  authorizeToolExecution?: AuthorizeToolExecutionHook | undefined;
   finalizeToolResult?: FinalizeToolResultHook | undefined;
   shouldContinueAfterStop?: ShouldContinueAfterStopHook | undefined;
 }

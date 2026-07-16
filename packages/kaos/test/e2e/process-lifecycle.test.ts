@@ -23,7 +23,7 @@ describe('e2e: process lifecycle', () => {
   let originalCwd: string;
 
   beforeEach(async () => {
-    kaos = new LocalKaos();
+    kaos = await LocalKaos.create();
     originalCwd = process.cwd();
     tempDir = await realpath(await mkdtemp(join(tmpdir(), 'kaos-proc-')));
     process.chdir(tempDir);
@@ -95,7 +95,7 @@ describe('e2e: process lifecycle', () => {
   });
 
   describe('long-running process → kill', () => {
-    it('start → verify running → kill → confirm exit', async () => {
+    it.skipIf(process.platform === 'win32')('start → verify running → kill → confirm exit', async () => {
       // Process that runs indefinitely
       const code = `
         process.stdout.write('started\\n');

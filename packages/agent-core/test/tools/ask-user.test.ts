@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { Agent } from '../../src/agent';
 import type { PermissionMode } from '../../src/agent/permission';
@@ -10,6 +10,7 @@ import {
   type AskUserQuestionInput,
 } from '../../src/tools/builtin/collaboration/ask-user';
 import { executeTool } from './fixtures/execute-tool';
+import { createBackgroundManager } from '../agent/background/helpers';
 
 const signal = new AbortController().signal;
 
@@ -61,6 +62,10 @@ function makeTool(
 }
 
 describe('AskUserQuestionTool', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it('exposes current metadata and schema', () => {
     const { tool } = makeTool();
 
@@ -79,6 +84,106 @@ describe('AskUserQuestionTool', () => {
         }),
       ).success,
     ).toBe(false);
+  });
+
+  it('rejects empty question text and empty option labels at the schema layer', () => {
+    expect(
+      AskUserQuestionInputSchema.safeParse(input({ question: '' })).success,
+    ).toBe(false);
+    expect(
+      AskUserQuestionInputSchema.safeParse(
+        input({
+          options: [
+            { label: '', description: 'Empty label' },
+            { label: 'B', description: '' },
+          ],
+        }),
+      ).success,
+    ).toBe(false);
+  });
+
+  it('rejects duplicate question texts across questions (schema + execution)', async () => {
+    const duplicated: AskUserQuestionInput = {
+      questions: [input().questions[0]!, input().questions[0]!],
+    };
+    expect(AskUserQuestionInputSchema.safeParse(duplicated).success).toBe(false);
+
+    const { tool, requestQuestion } = makeTool();
+    const result = await executeTool(tool, {
+      turnId: '0',
+      toolCallId: 'call_dup_question',
+      args: duplicated,
+      signal,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.output).toContain('unique');
+    expect(requestQuestion).not.toHaveBeenCalled();
+  });
+
+  it('rejects duplicate option labels within one question (schema + execution)', async () => {
+    const duplicated = input({
+      options: [
+        { label: 'Postgres', description: 'Relational storage' },
+        { label: 'Postgres', description: 'Same label again' },
+      ],
+    });
+    expect(AskUserQuestionInputSchema.safeParse(duplicated).success).toBe(false);
+
+    const { tool, requestQuestion } = makeTool();
+    const result = await executeTool(tool, {
+      turnId: '0',
+      toolCallId: 'call_dup_label',
+      args: duplicated,
+      signal,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.output).toContain('unique');
+    expect(requestQuestion).not.toHaveBeenCalled();
+  });
+
+  it('allows the same option label to appear in different questions', async () => {
+    const args: AskUserQuestionInput = {
+      questions: [
+        input().questions[0]!,
+        input({ question: 'Which cache?' }).questions[0]!,
+      ],
+    };
+    expect(AskUserQuestionInputSchema.safeParse(args).success).toBe(true);
+
+    const { tool, requestQuestion } = makeTool();
+    const result = await executeTool(tool, {
+      turnId: '0',
+      toolCallId: 'call_cross_label',
+      args,
+      signal,
+    });
+    expect(result.isError).toBe(false);
+    expect(requestQuestion).toHaveBeenCalledOnce();
+  });
+
+  it('rejects duplicate questions on the background path before starting a task', async () => {
+    const { manager } = createBackgroundManager();
+    const requestQuestion = vi.fn();
+    const agent = {
+      rpc: { requestQuestion },
+      telemetry: { track: vi.fn() },
+      background: manager,
+    } as unknown as Agent;
+    const tool = new AskUserQuestionTool(agent);
+
+    const result = await executeTool(tool, {
+      turnId: '0',
+      toolCallId: 'call_bg_dup',
+      args: {
+        questions: [input().questions[0]!, input().questions[0]!],
+        background: true,
+      },
+      signal,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.output).toContain('unique');
+    expect(result.output).not.toContain('task_id:');
+    expect(requestQuestion).not.toHaveBeenCalled();
   });
 
   it('describes the no-Other rule on options and the Recommended hint on label', () => {
@@ -104,6 +209,19 @@ describe('AskUserQuestionTool', () => {
 
     const labelSchema = optionsSchema.items.properties.label;
     expect(labelSchema.description).toContain("append '(Recommended)'");
+  });
+
+  it('always builds the background-question schema', () => {
+    const agent = {
+      rpc: { requestQuestion: vi.fn() },
+      telemetry: { track: vi.fn() },
+      background: createBackgroundManager().manager,
+    } as unknown as Agent;
+
+    const tool = new AskUserQuestionTool(agent);
+
+    expect(tool.description).toContain('Set background=true');
+    expect(JSON.stringify(tool.parameters)).toContain('background');
   });
 
   it.each(['manual', 'yolo'] as const)(
@@ -167,6 +285,91 @@ describe('AskUserQuestionTool', () => {
     });
   });
 
+  it('starts a background question task and stores the eventual answer in task output', async () => {
+    vi.stubEnv('KIMI_CODE_EXPERIMENTAL_FLAG', '1');
+
+    let resolveQuestion!: (result: QuestionResult) => void;
+    const questionResult = new Promise<QuestionResult>((resolve) => {
+      resolveQuestion = resolve;
+    });
+    const { manager } = createBackgroundManager();
+    const requestQuestion = vi.fn(async () => questionResult);
+    const telemetryTrack = vi.fn();
+    const agent = {
+      rpc: { requestQuestion },
+      telemetry: { track: telemetryTrack },
+      turn: { traceIdForTurn: () => undefined },
+      background: manager,
+    } as unknown as Agent;
+    const tool = new AskUserQuestionTool(agent);
+    expect(tool.description).toContain('Set background=true');
+
+    const result = await executeTool(tool, {
+      turnId: '0',
+      toolCallId: 'call_background_question',
+      args: { ...input(), background: true },
+      signal,
+    });
+
+    expect(result.isError).toBe(false);
+    expect(result.output).toContain('task_id: question-');
+    const outputText = typeof result.output === 'string' ? result.output : '';
+    const taskId = /task_id: (?<taskId>question-[0-9a-z]{8})/.exec(outputText)?.groups?.['taskId'];
+    expect(taskId).toBeDefined();
+    expect(manager.getTask(taskId!)).toMatchObject({
+      kind: 'question',
+      status: 'running',
+      questionCount: 1,
+      toolCallId: 'call_background_question',
+    });
+
+    resolveQuestion({ answers: { 'Which database?': 'SQLite' }, method: 'enter' });
+    await manager.wait(taskId!);
+
+    expect(manager.getTask(taskId!)).toMatchObject({ status: 'completed' });
+    expect(await manager.readOutput(taskId!)).toBe(
+      JSON.stringify({ answers: { 'Which database?': 'SQLite' } }),
+    );
+    expect(telemetryTrack).toHaveBeenCalledWith('question_answered', {
+      answered: 1,
+      method: 'enter',
+    });
+  });
+
+  it('starts background questions without an experimental flag', async () => {
+    let resolveQuestion!: (result: QuestionResult) => void;
+    const questionResult = new Promise<QuestionResult>((resolve) => {
+      resolveQuestion = resolve;
+    });
+    const { manager } = createBackgroundManager();
+    const requestQuestion = vi.fn(async () => questionResult);
+    const agent = {
+      rpc: { requestQuestion },
+      telemetry: { track: vi.fn() },
+      turn: { traceIdForTurn: () => undefined },
+      background: manager,
+    } as unknown as Agent;
+    const tool = new AskUserQuestionTool(agent);
+    expect(tool.description).toContain('Set background=true');
+
+    const result = await executeTool(tool, {
+      turnId: '0',
+      toolCallId: 'call_bg_enabled',
+      args: { ...input(), background: true },
+      signal,
+    });
+
+    expect(result.isError).toBe(false);
+    expect(result.output).toContain('task_id: question-');
+    const outputText = typeof result.output === 'string' ? result.output : '';
+    const taskId = /task_id: (?<taskId>question-[0-9a-z]{8})/.exec(outputText)?.groups?.['taskId'];
+    expect(taskId).toBeDefined();
+    expect(manager.getTask(taskId!)).toMatchObject({ status: 'running' });
+
+    resolveQuestion({ answers: { Postgres: true } });
+    await manager.wait(taskId!);
+  });
+
   it('returns a dismissed message when every question is dismissed', async () => {
     const { tool, telemetryTrack } = makeTool({ requestQuestion: async () => null });
 
@@ -182,7 +385,24 @@ describe('AskUserQuestionTool', () => {
     expect(result).toMatchObject({ isError: false });
     expect(result.output).toContain('dismissed');
     expect(result.output).toContain('answers');
-    expect(telemetryTrack).toHaveBeenCalledWith('question_dismissed');
+    expect(telemetryTrack).toHaveBeenCalledWith('question_dismissed', { trace_id: undefined });
+  });
+
+  it('attaches the request trace id to question telemetry', async () => {
+    const { tool, telemetryTrack } = makeTool();
+
+    await executeTool(tool, {
+      turnId: '0',
+      toolCallId: 'call_question',
+      traceId: 'trace-question-1',
+      args: input(),
+      signal,
+    });
+
+    expect(telemetryTrack).toHaveBeenCalledWith(
+      'question_answered',
+      expect.objectContaining({ answered: 1, trace_id: 'trace-question-1' }),
+    );
   });
 
   it('resolves question rpc error responses as dismissed answers', async () => {

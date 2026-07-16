@@ -225,6 +225,8 @@ function _typeOnlyChecks(): void {
     turnId: 't1',
     step: 1,
     finishReason: 'filtered',
+    llmFirstTokenLatencyMs: 10,
+    llmStreamDurationMs: 20,
     providerFinishReason: 'filtered',
     rawFinishReason: 'content_filter',
   };
@@ -296,14 +298,16 @@ function _typeOnlyChecks(): void {
 
   const toolCallHookContext: ToolExecutionHookContext = {
     ...stepHookContext,
-    toolCall: { type: 'function', id: 'tc1', function: { name: 'echo', arguments: '{}' } },
+    toolCall: { type: 'function', id: 'tc1', name: 'echo', arguments: '{}' },
+    toolCalls: [{ type: 'function', id: 'tc1', name: 'echo', arguments: '{}' }],
     args: {},
   };
   void toolCallHookContext;
 
   const _badToolExecutionHookContext: ToolExecutionHookContext = {
     ...stepHookContext,
-    toolCall: { type: 'function', id: 'tc1', function: { name: 'echo', arguments: '{}' } },
+    toolCall: { type: 'function', id: 'tc1', name: 'echo', arguments: '{}' },
+    toolCalls: [{ type: 'function', id: 'tc1', name: 'echo', arguments: '{}' }],
     // @ts-expect-error — tool hooks receive `args`, not the old `input` field.
     input: {},
   };
@@ -401,12 +405,12 @@ function _typeOnlyChecks(): void {
   const toolCall: ToolCall = {
     type: 'function',
     id: 'tc1',
-    function: { name: 'echo', arguments: '{"text":"hi"}' },
+    name: 'echo', arguments: '{"text":"hi"}',
   };
   void toolCall;
   const _badToolCall: ToolCall = {
-    // @ts-expect-error — the loop no longer owns a parsed `{ name, args }` tool-call shape.
     name: 'echo',
+    // @ts-expect-error — ToolCall has `name` but no `args` property.
     args: {},
   };
   void _badToolCall;
@@ -439,6 +443,7 @@ function _typeOnlyChecks(): void {
     description: 'x',
     parameters: { type: 'object' },
     resolveExecution: () => ({
+      approvalRule: 'x',
       execute: async (_ctx: ExecutableToolContext) => ({ output: 'ok' }),
     }),
   };
@@ -450,6 +455,7 @@ function _typeOnlyChecks(): void {
     resolveExecution: (args) => ({
       accesses: ToolAccesses.none(),
       description: `Running ${args.text}`,
+      approvalRule: 'x',
       execute: async (_ctx: ExecutableToolContext) => ({ output: 'ok' }),
     }),
   };
@@ -459,6 +465,7 @@ function _typeOnlyChecks(): void {
     description: 'x',
     parameters: { type: 'object' },
     resolveExecution: () => ({
+      approvalRule: 'x',
       execute: async (_ctx: ExecutableToolContext) => ({ output: 'ok' }),
     }),
     // @ts-expect-error — there is no second Zod schema source on ExecutableTool.
@@ -479,6 +486,7 @@ function _typeOnlyChecks(): void {
   };
   const prepareToolExecutionHook: PrepareToolExecutionHook = async (ctx) => ({
     updatedArgs: ctx.args,
+    executionMetadata: ctx.toolCalls,
   });
   const finalizeToolResultHook: FinalizeToolResultHook = async (ctx) => ctx.result;
   const shouldContinueAfterStopHook: ShouldContinueAfterStopHook = async (ctx) => ({
@@ -498,7 +506,14 @@ function _typeOnlyChecks(): void {
   // LoopEvent is a closed union with the documented variants.
   const _evs: LoopEvent[] = [
     { type: 'step.begin', uuid: 's1', turnId: 't1', step: 1 },
-    { type: 'step.end', uuid: 's1', turnId: 't1', step: 1 },
+    {
+      type: 'step.end',
+      uuid: 's1',
+      turnId: 't1',
+      step: 1,
+      llmFirstTokenLatencyMs: 10,
+      llmStreamDurationMs: 20,
+    },
     {
       type: 'content.part',
       uuid: 'c1',

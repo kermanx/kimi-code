@@ -10,13 +10,19 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { RetryableRefreshError, OAuthError, OAuthUnauthorizedError } from '../src/errors';
+import {
+  OAuthConnectionError,
+  OAuthError,
+  OAuthUnauthorizedError,
+  RetryableRefreshError,
+} from '../src/errors';
 import {
   pollDeviceToken,
   refreshAccessToken,
   requestDeviceAuthorization,
   type RefreshOptions,
 } from '../src/oauth';
+import { KIMI_CODE_PLATFORM } from '../src/identity';
 import type { DeviceHeaders, OAuthFlowConfig } from '../src/types';
 
 interface FakeResponse {
@@ -112,7 +118,7 @@ class FakeOAuthServer {
 let server: FakeOAuthServer;
 
 const TEST_DEVICE_HEADERS: DeviceHeaders = {
-  'X-Msh-Platform': 'kimi-code-cli',
+  'X-Msh-Platform': KIMI_CODE_PLATFORM,
   'X-Msh-Version': '0.0.0-test',
   'X-Msh-Device-Name': 'test-device',
   'X-Msh-Device-Model': 'test-model',
@@ -222,7 +228,7 @@ describe('requestDeviceAuthorization', () => {
     });
     await requestAuth();
     const recorded = server.recorded[0]!;
-    expect(recorded.headers['x-msh-platform']).toBe('kimi-code-cli');
+    expect(recorded.headers['x-msh-platform']).toBe(KIMI_CODE_PLATFORM);
     expect(recorded.headers['x-msh-device-id']).toBe('test-device-id');
     expect(recorded.headers['x-msh-version']).toBe('0.0.0-test');
     expect(recorded.headers['user-agent'] ?? '').not.toContain('kimi-code-cli');
@@ -264,6 +270,15 @@ describe('requestDeviceAuthorization', () => {
       body: { error: 'server_error' },
     });
     await expect(requestAuth()).rejects.toBeInstanceOf(OAuthError);
+  });
+
+  it('surfaces message fields from failed device authorization responses', async () => {
+    server.enqueue('/api/oauth/device_authorization', {
+      status: 400,
+      body: { message: 'device authorization disabled' },
+    });
+
+    await expect(requestAuth()).rejects.toThrow(/device authorization disabled/);
   });
 
   it('throws when device_code is missing (required-field validation)', async () => {
@@ -382,6 +397,15 @@ describe('pollDeviceToken', () => {
     await expect(pollToken(flowConfig(), 'd')).rejects.toBeInstanceOf(OAuthError);
   });
 
+  it('surfaces nested API error messages from failed polling responses', async () => {
+    server.enqueue('/api/oauth/token', {
+      status: 400,
+      body: { error: { code: 'invalid_request', message: 'poll rejected by server' } },
+    });
+
+    await expect(pollToken(flowConfig(), 'd')).rejects.toThrow(/poll rejected by server/);
+  });
+
   it('throws when success response is missing refresh_token (required-field validation)', async () => {
     server.enqueue('/api/oauth/token', {
       status: 200,
@@ -480,6 +504,15 @@ describe('refreshAccessToken', () => {
     );
   });
 
+  it('surfaces nested API error messages from unauthorized refresh responses', async () => {
+    server.enqueue('/api/oauth/token', {
+      status: 401,
+      body: { error: { message: 'refresh token revoked' } },
+    });
+
+    await expect(refreshToken(flowConfig(), 'old-rt')).rejects.toThrow(/refresh token revoked/);
+  });
+
   it('throws OAuthUnauthorizedError on invalid_grant refresh responses', async () => {
     server.enqueue('/api/oauth/token', {
       status: 400,
@@ -539,7 +572,7 @@ describe('refreshAccessToken', () => {
     // Single attempt against unreachable host should throw (not RetryableRefreshError)
     await expect(
       refreshToken(badConfig, 'rt', { maxRetries: 1, backoffMs: () => 0 }),
-    ).rejects.toThrow(/OAuth request|fetch failed|Token refresh request|ECONNREFUSED|connect/i);
+    ).rejects.toBeInstanceOf(OAuthConnectionError);
   });
 
   it('sends grant_type=refresh_token + refresh_token', async () => {

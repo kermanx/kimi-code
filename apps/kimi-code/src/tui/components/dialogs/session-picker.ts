@@ -9,11 +9,11 @@ import {
   truncateToWidth,
   visibleWidth,
   type Focusable,
-} from '@earendil-works/pi-tui';
-import chalk from 'chalk';
-
+} from '@moonshot-ai/pi-tui';
 import { formatSessionLabel } from '#/migration/index';
-import type { ColorPalette } from '#/tui/theme/colors';
+import { CURRENT_MARK, SELECT_POINTER } from '#/tui/constant/symbols';
+import { currentTheme } from '#/tui/theme';
+import { SearchableList } from '#/tui/utils/searchable-list';
 
 export interface SessionRow {
   readonly id: string;
@@ -25,7 +25,6 @@ export interface SessionRow {
 }
 
 const ELLIPSIS = '…';
-const CURRENT_BADGE = '(current)';
 
 function formatRelativeTime(ts: number): string {
   // SessionSummary timestamps come from filesystem stat `*timeMs`,
@@ -75,118 +74,232 @@ function singleLine(text: string): string {
   return text.replaceAll(/\s+/g, ' ').trim();
 }
 
+function sessionSearchText(session: SessionRow): string {
+  return singleLine((session.title ?? session.id).trim() || session.id);
+}
+
 export class SessionPickerComponent extends Container implements Focusable {
   private sessions: SessionRow[];
   private currentSessionId: string;
-  private colors: ColorPalette;
-  private onSelect: (sessionId: string) => void;
+  private onSelect: (session: SessionRow) => void;
   private onCancel: () => void;
+  private onToggleScope?: (selectedSessionId: string) => void;
   private maxVisibleSessions: number;
+  private pageSize: number;
+  private visibleCount: number;
+  private scope: 'cwd' | 'all';
   private loading: boolean;
+  private list: SearchableList<SessionRow>;
 
   focused = false;
-  private selectedIndex = 0;
 
   constructor(opts: {
     sessions: SessionRow[];
     loading: boolean;
     currentSessionId: string;
-    colors: ColorPalette;
-    onSelect: (sessionId: string) => void;
+    scope?: 'cwd' | 'all';
+    initialSelectedSessionId?: string;
+    pageSize?: number;
+    onSelect: (session: SessionRow) => void;
     onCancel: () => void;
+    onCtrlC?: () => void;
+    onCtrlD?: () => void;
+    onToggleScope?: (selectedSessionId: string) => void;
     maxVisibleSessions?: number;
   }) {
     super();
     this.sessions = opts.sessions;
     this.loading = opts.loading;
     this.currentSessionId = opts.currentSessionId;
-    this.colors = opts.colors;
+    this.scope = opts.scope ?? 'cwd';
     this.onSelect = opts.onSelect;
     this.onCancel = opts.onCancel;
+    this.onToggleScope = opts.onToggleScope;
     this.maxVisibleSessions = opts.maxVisibleSessions ?? 4;
+    this.pageSize = Math.max(1, opts.pageSize ?? 50);
+    const initialIndex = this.resolveInitialSelectedIndex(opts.initialSelectedSessionId);
+    this.list = new SearchableList({
+      items: this.sessions,
+      toSearchText: sessionSearchText,
+      pageSize: this.pageSize,
+      initialIndex,
+      searchable: true,
+    });
+    const initialLoadedPages = Math.ceil((initialIndex + 1) / this.pageSize);
+    this.visibleCount = Math.min(this.sessions.length, initialLoadedPages * this.pageSize);
+    this.onCtrlC = opts.onCtrlC;
+    this.onCtrlD = opts.onCtrlD;
+  }
+
+  private readonly onCtrlC?: () => void;
+  private readonly onCtrlD?: () => void;
+
+  private resolveInitialSelectedIndex(initialSelectedSessionId: string | undefined): number {
+    if (initialSelectedSessionId === undefined) return 0;
+    const index = this.sessions.findIndex((session) => session.id === initialSelectedSessionId);
+    return Math.max(index, 0);
+  }
+
+  private filteredSessions(): readonly SessionRow[] {
+    return this.list.view().items;
+  }
+
+  private loadedSessions(sessions: readonly SessionRow[] = this.filteredSessions()): SessionRow[] {
+    return sessions.slice(0, Math.min(sessions.length, this.visibleCount));
+  }
+
+  private syncVisibleCount(previousQuery: string): void {
+    const view = this.list.view();
+    if (view.query !== previousQuery) {
+      this.visibleCount = Math.min(view.items.length, this.pageSize);
+      return;
+    }
+
+    const loadedCount = Math.min(view.items.length, this.visibleCount);
+    if (view.selectedIndex >= loadedCount - 1 && loadedCount < view.items.length) {
+      this.visibleCount = Math.min(view.items.length, this.visibleCount + this.pageSize);
+    }
   }
 
   handleInput(data: string): void {
+    if (matchesKey(data, Key.ctrl('c'))) {
+      this.onCtrlC?.();
+      return;
+    }
+    if (matchesKey(data, Key.ctrl('d'))) {
+      this.onCtrlD?.();
+      return;
+    }
+    if (matchesKey(data, Key.ctrl('a'))) {
+      this.onToggleScope?.(this.list.selected()?.id ?? this.currentSessionId);
+      return;
+    }
     if (matchesKey(data, Key.escape)) {
+      if (this.list.clearQuery()) {
+        this.visibleCount = Math.min(this.filteredSessions().length, this.pageSize);
+        return;
+      }
       this.onCancel();
       return;
     }
-    if (matchesKey(data, Key.enter) && this.sessions.length > 0) {
-      const session = this.sessions[this.selectedIndex];
-      if (session) this.onSelect(session.id);
+    if (matchesKey(data, Key.enter)) {
+      const session = this.list.selected();
+      if (session) this.onSelect(session);
       return;
     }
-    if (matchesKey(data, Key.up)) {
-      this.selectedIndex = Math.max(0, this.selectedIndex - 1);
-      return;
-    }
-    if (matchesKey(data, Key.down)) {
-      this.selectedIndex = Math.min(this.sessions.length - 1, this.selectedIndex + 1);
+
+    const previousQuery = this.list.view().query;
+    if (this.list.handleKey(data)) {
+      this.syncVisibleCount(previousQuery);
     }
   }
 
   override render(width: number): string[] {
-    const colors = this.colors;
-    const lines: string[] = [chalk.hex(colors.primary)('─'.repeat(width))];
+    return this.renderLines(width).map((line) => truncateToWidth(line, width, ELLIPSIS));
+  }
+
+  // Builds the raw lines; `render()` applies a final width clamp so no line
+  // can ever exceed the terminal width. The per-line budgets below keep the
+  // layout tidy at normal widths, but on a very narrow terminal those budgets
+  // floor at a minimum and the trailing time/badge are appended in full, so
+  // the clamp in `render()` is what guarantees the renderer's invariant and
+  // prevents the "Rendered line exceeds terminal width" crash (issue #240).
+  private renderLines(width: number): string[] {
+    const lines: string[] = [currentTheme.fg('primary', '─'.repeat(width))];
+    const title = this.scope === 'all' ? 'All sessions' : 'Sessions';
+    const scopeHint =
+      this.onToggleScope === undefined
+        ? undefined
+        : this.scope === 'all'
+          ? 'Ctrl+A current cwd'
+          : 'Ctrl+A all';
 
     if (this.loading) {
-      lines.push(chalk.hex(colors.primary).bold(truncateToWidth('Sessions', width, ELLIPSIS)));
+      lines.push(currentTheme.boldFg('primary', truncateToWidth(title, width, ELLIPSIS)));
       lines.push(
-        chalk.hex(colors.textMuted)(truncateToWidth('Loading sessions...', width, ELLIPSIS)),
+        currentTheme.fg('textMuted', truncateToWidth('Loading sessions...', width, ELLIPSIS)),
       );
-      lines.push(chalk.hex(colors.primary)('─'.repeat(width)));
+      lines.push(currentTheme.fg('primary', '─'.repeat(width)));
       return lines;
     }
 
     if (this.sessions.length === 0) {
-      lines.push(chalk.hex(colors.primary).bold(truncateToWidth('Sessions', width, ELLIPSIS)));
-      lines.push(
-        chalk.hex(colors.textMuted)(
-          truncateToWidth('No sessions found. Press Escape to close.', width, ELLIPSIS),
-        ),
+      const hintParts = [scopeHint, 'Esc cancel'].filter(
+        (item): item is string => item !== undefined,
       );
-      lines.push(chalk.hex(colors.primary)('─'.repeat(width)));
+      lines.push(currentTheme.boldFg('primary', truncateToWidth(title, width, ELLIPSIS)));
+      lines.push(
+        currentTheme.fg('textMuted', truncateToWidth(hintParts.join(' · '), width, ELLIPSIS)),
+      );
+      lines.push('');
+      lines.push(
+        currentTheme.fg('textMuted', truncateToWidth('No sessions found.', width, ELLIPSIS)),
+      );
+      lines.push(currentTheme.fg('primary', '─'.repeat(width)));
       return lines;
     }
 
-    const headerLabel = 'Sessions ';
-    const headerHint = '(↑↓ navigate, Enter select, Esc cancel)';
-    const labelWidth = visibleWidth(headerLabel);
-    const hintBudget = Math.max(0, width - labelWidth);
-    const shownHint = truncateToWidth(headerHint, hintBudget, ELLIPSIS);
-    lines.push(
-      chalk.hex(colors.primary).bold(headerLabel) + chalk.hex(colors.textMuted)(shownHint),
-    );
+    const view = this.list.view();
+    const titleSuffix =
+      view.query.length === 0 ? currentTheme.fg('textMuted', '  (type to search)') : '';
+    const hintParts = [
+      ...(view.query.length > 0 ? ['Backspace clear'] : []),
+      '↑↓ navigate',
+      scopeHint,
+      'Enter select',
+      'Esc cancel',
+    ].filter((item): item is string => item !== undefined);
+
+    lines.push(currentTheme.boldFg('primary', title) + titleSuffix);
+    lines.push(currentTheme.fg('textMuted', hintParts.join(' · ')));
     lines.push('');
 
+    if (view.query.length > 0) {
+      lines.push(currentTheme.fg('primary', 'Search: ') + currentTheme.fg('text', view.query));
+    }
+
+    const loadedSessions = this.loadedSessions(view.items);
+    if (loadedSessions.length === 0) {
+      lines.push(currentTheme.fg('textMuted', truncateToWidth('No matches', width, ELLIPSIS)));
+      lines.push(currentTheme.fg('primary', '─'.repeat(width)));
+      return lines;
+    }
+    const selectedIndex = view.selectedIndex;
     const visibleStart = Math.max(
       0,
       Math.min(
-        this.selectedIndex - Math.floor(this.maxVisibleSessions / 2),
-        Math.max(0, this.sessions.length - this.maxVisibleSessions),
+        selectedIndex - Math.floor(this.maxVisibleSessions / 2),
+        Math.max(0, loadedSessions.length - this.maxVisibleSessions),
       ),
     );
-    const visibleSessions = this.sessions.slice(
+    const visibleSessions = loadedSessions.slice(
       visibleStart,
       visibleStart + this.maxVisibleSessions,
     );
 
     for (const [vi, session] of visibleSessions.entries()) {
       const index = visibleStart + vi;
-      const isSelected = index === this.selectedIndex;
+      const isSelected = index === selectedIndex;
       const isCurrent = session.id === this.currentSessionId;
       const card = this.renderSessionCard(width, session, isSelected, isCurrent);
       lines.push(...card);
       if (vi < visibleSessions.length - 1) lines.push('');
     }
 
-    if (this.sessions.length > visibleSessions.length) {
+    const filteredCount = view.items.length;
+    if (loadedSessions.length > visibleSessions.length || view.query.length > 0) {
       lines.push('');
-      const footer = `Showing ${String(visibleStart + 1)}-${String(visibleStart + visibleSessions.length)} of ${String(this.sessions.length)} sessions`;
-      lines.push(chalk.hex(colors.textMuted)(truncateToWidth(footer, width, ELLIPSIS)));
+      const totalSuffix =
+        view.query.length > 0
+          ? `${String(loadedSessions.length)} loaded / ${String(filteredCount)} matches`
+          : loadedSessions.length === this.sessions.length
+            ? `${String(loadedSessions.length)} sessions`
+            : `${String(loadedSessions.length)} loaded / ${String(this.sessions.length)} sessions`;
+      const footer = `Showing ${String(visibleStart + 1)}-${String(visibleStart + visibleSessions.length)} of ${totalSuffix}`;
+      lines.push(currentTheme.fg('textMuted', truncateToWidth(footer, width, ELLIPSIS)));
     }
 
-    lines.push(chalk.hex(colors.primary)('─'.repeat(width)));
+    lines.push(currentTheme.fg('primary', '─'.repeat(width)));
     return lines;
   }
 
@@ -196,19 +309,19 @@ export class SessionPickerComponent extends Container implements Focusable {
     isSelected: boolean,
     isCurrent: boolean,
   ): string[] {
-    const colors = this.colors;
-    const pointer = isSelected ? '❯' : ' ';
+    const pointer = isSelected ? SELECT_POINTER : ' ';
     const indent = '  ';
     const indentWidth = visibleWidth(indent);
-    const titleColor = isSelected ? colors.primary : colors.text;
-    const titleStyle = isSelected ? chalk.hex(titleColor).bold : chalk.hex(titleColor);
+    const titleColor: 'primary' | 'text' = isSelected ? 'primary' : 'text';
+    const titleStyle = (text: string) =>
+      isSelected ? currentTheme.boldFg(titleColor, text) : currentTheme.fg(titleColor, text);
 
     const time = formatRelativeTime(session.updated_at);
-    const badge = isCurrent ? CURRENT_BADGE : '';
+    const badge = isCurrent ? CURRENT_MARK : '';
     const rawTitle = (session.title ?? session.id).trim() || session.id;
     const titleSource = formatSessionLabel({ title: rawTitle, metadata: session.metadata });
 
-    // Inline trailing parts after the title: "<title>  <time>  (current)".
+    // Inline trailing parts after the title: "<title>  <time>  ← current".
     const trailingParts = [time, badge].filter((p) => p.length > 0);
     const trailingText = trailingParts.length > 0 ? '  ' + trailingParts.join('  ') : '';
     const trailingWidth = visibleWidth(trailingText);
@@ -216,14 +329,15 @@ export class SessionPickerComponent extends Container implements Focusable {
     const titleBudget = Math.max(8, width - headerPrefixWidth - trailingWidth);
     const shownTitle = truncateToWidth(singleLine(titleSource), titleBudget, ELLIPSIS);
 
-    let header = chalk.hex(isSelected ? colors.primary : colors.textDim)(pointer + ' ');
+    let header = currentTheme.fg(isSelected ? 'primary' : 'textDim', pointer + ' ');
     header += titleStyle(shownTitle);
-    if (time.length > 0) header += '  ' + chalk.hex(colors.textDim)(time);
-    if (badge.length > 0) header += '  ' + chalk.hex(colors.success)(badge);
+    if (time.length > 0) header += '  ' + currentTheme.fg('textDim', time);
+    if (badge.length > 0) header += '  ' + currentTheme.fg('success', badge);
     const card: string[] = [header];
 
-    // Session id is rendered in full (no truncation). The directory wraps to
-    // its own line if it would push past the terminal edge.
+    // Session id is rendered in full at normal widths (the final clamp in
+    // `render()` truncates it only when the terminal is narrower than the id).
+    // The directory wraps to its own line if it would push past the edge.
     const fullId = session.id;
     const idWidth = visibleWidth(fullId);
     const metaGap = '   ';
@@ -235,22 +349,23 @@ export class SessionPickerComponent extends Container implements Focusable {
     if (idLineWidth + metaGapWidth + dirWidth <= width) {
       card.push(
         indent +
-          chalk.hex(colors.textMuted)(fullId) +
-          chalk.hex(colors.textDim)(metaGap) +
-          chalk.hex(colors.textMuted)(aliasedDir),
+          currentTheme.fg('textMuted', fullId) +
+          currentTheme.fg('textDim', metaGap) +
+          currentTheme.fg('textMuted', aliasedDir),
       );
     } else {
       // Not enough room for both on one line — keep the id intact and put the
       // directory on the next line (left-truncated only if it still doesn't fit).
       card.push(
         indent +
-          chalk.hex(colors.textMuted)(
+          currentTheme.fg(
+            'textMuted',
             truncateToWidth(fullId, Math.max(idWidth, width - indentWidth), ELLIPSIS),
           ),
       );
       const dirBudget = Math.max(8, width - indentWidth);
       const dir = truncatePathLeft(aliasedDir, dirBudget);
-      card.push(indent + chalk.hex(colors.textMuted)(dir));
+      card.push(indent + currentTheme.fg('textMuted', dir));
     }
 
     const rawPrompt = session.last_prompt?.trim();
@@ -259,7 +374,7 @@ export class SessionPickerComponent extends Container implements Focusable {
       const promptMarkerWidth = visibleWidth(promptMarker);
       const promptBudget = Math.max(8, width - indentWidth - promptMarkerWidth);
       const promptText = truncateToWidth(singleLine(rawPrompt), promptBudget, ELLIPSIS);
-      const promptLine = indent + chalk.hex(colors.textDim)(promptMarker + promptText);
+      const promptLine = indent + currentTheme.fg('textDim', promptMarker + promptText);
       card.push(promptLine);
     }
 

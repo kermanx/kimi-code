@@ -1,4 +1,4 @@
-import type { Terminal } from '@earendil-works/pi-tui';
+import type { Terminal } from '@moonshot-ai/pi-tui';
 import type { BackgroundTaskInfo, BackgroundTaskStatus } from '@moonshot-ai/kimi-code-sdk';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -44,6 +44,7 @@ function fakeTerminal(rows: number, columns = 120): Terminal {
 function task(overrides: Partial<BackgroundTaskInfo> = {}): BackgroundTaskInfo {
   return {
     taskId: 'bash-abcd1234',
+    kind: 'process',
     command: 'npm run dev',
     description: 'dev server',
     status: 'running',
@@ -52,7 +53,7 @@ function task(overrides: Partial<BackgroundTaskInfo> = {}): BackgroundTaskInfo {
     startedAt: Date.now() - 60_000,
     endedAt: null,
     ...overrides,
-  };
+  } as BackgroundTaskInfo;
 }
 
 function makeProps(overrides: Partial<TasksBrowserProps> = {}): TasksBrowserProps {
@@ -63,7 +64,6 @@ function makeProps(overrides: Partial<TasksBrowserProps> = {}): TasksBrowserProp
     tailOutput: undefined,
     tailLoading: false,
     flashMessage: undefined,
-    colors: darkColors,
     onSelect: vi.fn(),
     onToggleFilter: vi.fn(),
     onRefresh: vi.fn(),
@@ -152,6 +152,30 @@ describe('TasksBrowserApp — full-screen rendering', () => {
     expect(out).toContain('long running task');
   });
 
+  it('shows question task details in the Detail pane', () => {
+    const out = strip(
+      makeApp({
+        tasks: [
+          task({
+            taskId: 'question-aaaaaaaa',
+            kind: 'question',
+            description: 'Which database?',
+            questionCount: 1,
+            toolCallId: 'call_question',
+          }),
+        ],
+        selectedTaskId: 'question-aaaaaaaa',
+      })
+        .render(120)
+        .join('\n'),
+    );
+    expect(out).toContain('question-aaaaaaaa');
+    expect(out).toContain('Questions:');
+    expect(out).toContain('1');
+    expect(out).toContain('Tool call:');
+    expect(out).toContain('call_question');
+  });
+
   it('renders tail output in the Preview Output pane', () => {
     const out = strip(
       makeApp({
@@ -194,10 +218,44 @@ describe('TasksBrowserApp — full-screen rendering', () => {
     expect(out).not.toContain('bash-bbbbbbbb');
   });
 
+  it('filters out foreground tasks (detached === false)', () => {
+    const tasks = [
+      task({ taskId: 'bash-foreground', detached: false, status: 'running' }),
+      task({ taskId: 'bash-background', detached: true, status: 'running' }),
+    ];
+    const out = strip(makeApp({ tasks, filter: 'all' }).render(120).join('\n'));
+    expect(out).not.toContain('bash-foreground');
+    expect(out).toContain('bash-background');
+  });
+
+  it('keeps background tasks with detached === true even when terminal', () => {
+    const tasks = [task({ taskId: 'bash-done', detached: true, status: 'completed' })];
+    const out = strip(makeApp({ tasks, filter: 'all' }).render(120).join('\n'));
+    expect(out).toContain('bash-done');
+  });
+
+  it('keeps ghost tasks whose detached field is undefined', () => {
+    // task() leaves `detached` undefined by default, mimicking reconcile ghosts.
+    const tasks = [task({ taskId: 'bash-ghost', status: 'lost' })];
+    const out = strip(makeApp({ tasks, filter: 'all' }).render(120).join('\n'));
+    expect(out).toContain('bash-ghost');
+  });
+
+  it('applies active filter after excluding foreground tasks', () => {
+    const tasks = [
+      task({ taskId: 'bash-fg-running', detached: false, status: 'running' }),
+      task({ taskId: 'bash-bg-running', detached: true, status: 'running' }),
+      task({ taskId: 'bash-bg-done', detached: true, status: 'completed' }),
+    ];
+    const out = strip(makeApp({ tasks, filter: 'active' }).render(120).join('\n'));
+    expect(out).not.toContain('bash-fg-running');
+    expect(out).toContain('bash-bg-running');
+    expect(out).not.toContain('bash-bg-done');
+  });
+
   it('renders without throwing for every BackgroundTaskStatus', () => {
     const statuses: BackgroundTaskStatus[] = [
       'running',
-      'awaiting_approval',
       'completed',
       'failed',
       'killed',

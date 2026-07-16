@@ -20,8 +20,19 @@
  * `tui/components/**` and rejects bare-literal comparisons.
  */
 
-import { decodeKittyPrintable } from '@earendil-works/pi-tui';
+import { decodeKittyPrintable } from '@moonshot-ai/pi-tui';
 
 export function printableChar(data: string): string {
   return decodeKittyPrintable(data) ?? data;
+}
+
+/**
+ * True when a decoded key is a single printable character safe to append to a
+ * text query (e.g. a search box). Rejects C0 control chars, DEL, and any
+ * multi-codepoint escape sequence. Space is accepted.
+ */
+export function isPrintableChar(ch: string): boolean {
+  if (ch.length !== 1) return false;
+  const code = ch.codePointAt(0)!;
+  return code >= 0x20 && code !== 0x7f;
 }

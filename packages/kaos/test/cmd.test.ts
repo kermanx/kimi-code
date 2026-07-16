@@ -4,8 +4,6 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { resetCurrentKaos, setCurrentKaos } from '#/current';
-import type { KaosToken } from '#/current';
 import type { Kaos } from '#/kaos';
 import { LocalKaos } from '#/local';
 import type { KaosProcess } from '#/process';
@@ -56,17 +54,14 @@ async function runCmd(
 
 describe.skipIf(process.platform !== 'win32')('LocalKaos cmd.exe', () => {
   let kaos: Kaos;
-  let token: KaosToken;
   let tmpDir: string;
 
   beforeEach(async () => {
     tmpDir = await mkdtemp(join(tmpdir(), 'kaos-cmd-'));
-    kaos = new LocalKaos();
-    token = setCurrentKaos(kaos);
+    kaos = await LocalKaos.create();
   });
 
   afterEach(async () => {
-    resetCurrentKaos(token);
     await rm(tmpDir, { recursive: true, force: true });
   });
 
@@ -94,21 +89,21 @@ describe.skipIf(process.platform !== 'win32')('LocalKaos cmd.exe', () => {
   });
 
   it('should perform file operations', async () => {
-    // Mirror Python test_local_kaos_cmd.py::test_file_operations: two separate
-    // kaos.exec invocations (write via redirect, then read back via type),
-    // assert the file lands on disk between them, and pin the exact stdout
-    // byte-for-byte so any CRLF drift is caught immediately.
+    // Write via kaos (avoids cmd.exe redirect quoting quirks on Windows where
+    // Node's auto-escaping of the redirected path breaks the command), then
+    // read back via `type` and pin the exact stdout byte-for-byte.
     const filePath = join(tmpDir, 'test_file.txt').replaceAll('/', '\\');
 
-    const write = await runCmd(kaos, `echo Test content> "${filePath}"`);
-    expect(write.exitCode).toBe(0);
-    expect(write.stdout).toBe('');
-    expect(write.stderr).toBe('');
+    await kaos.writeText(filePath, 'Test content\r\n');
 
     const statInfo = await fsStat(filePath);
     expect(statInfo.isFile()).toBe(true);
 
-    const read = await runCmd(kaos, `type "${filePath}"`);
+    // The path contains no spaces (tmpDir is under the 8.3 short-name temp
+    // dir), so pass it unquoted: wrapping it in `"…"` would make Node's
+    // Windows arg-quoting escape the inner quotes to `\"`, which cmd.exe
+    // does not unescape — leaving `type` looking for a literal `\"…\"`.
+    const read = await runCmd(kaos, `type ${filePath}`);
     expect(read.exitCode).toBe(0);
     expect(read.stdout).toBe('Test content\r\n');
     expect(read.stderr).toBe('');

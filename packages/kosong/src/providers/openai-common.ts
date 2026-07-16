@@ -2,11 +2,14 @@ import {
   APIConnectionError,
   APITimeoutError,
   ChatProviderError,
+  classifyBaseApiError,
   normalizeAPIStatusError,
+  parseRetryAfterMs,
+  parseTraceId,
 } from '#/errors';
 import { extractText } from '#/message';
 import type { ContentPart, Message } from '#/message';
-import type { FinishReason, ThinkingEffort } from '#/provider';
+import type { FinishReason } from '#/provider';
 import type { Tool } from '#/tool';
 import type { TokenUsage } from '#/usage';
 import {
@@ -84,18 +87,6 @@ export function toolToOpenAI(tool: Tool): OpenAIToolParam {
     },
   };
 }
-const NETWORK_RE = /network|connection|connect|disconnect/i;
-const TIMEOUT_RE = /timed?\s*out|timeout|deadline/i;
-
-function classifyBaseApiError(message: string): ChatProviderError {
-  if (TIMEOUT_RE.test(message)) {
-    return new APITimeoutError(message);
-  }
-  if (NETWORK_RE.test(message)) {
-    return new APIConnectionError(message);
-  }
-  return new ChatProviderError(`Error: ${message}`);
-}
 
 /**
  * Convert an OpenAI SDK error (or raw Error) to a kosong `ChatProviderError`.
@@ -114,7 +105,13 @@ export function convertOpenAIError(error: unknown): ChatProviderError {
   // APIError with a status code => status error
   if (error instanceof OpenAIAPIError && typeof error.status === 'number') {
     const reqId = error.requestID ?? null;
-    return normalizeAPIStatusError(error.status, error.message, reqId);
+    return normalizeAPIStatusError(
+      error.status,
+      error.message,
+      reqId,
+      parseRetryAfterMs(error.headers),
+      parseTraceId(error.headers),
+    );
   }
   // Base APIError with no status and no body => transport-layer failure.
   // When the error has a body (e.g. SSE error events from the server),
@@ -129,8 +126,13 @@ export function convertOpenAIError(error: unknown): ChatProviderError {
   if (error instanceof OpenAIError) {
     return new ChatProviderError(`Error: ${error.message}`);
   }
+  // Raw, non-SDK errors (e.g. undici's `TypeError: terminated` raised when a
+  // streaming response body is dropped mid-flight) never get wrapped by the
+  // OpenAI SDK during stream iteration. Route them through the same
+  // transport-layer heuristic so genuine connection failures become
+  // retryable instead of fatal generic errors.
   if (error instanceof Error) {
-    return new ChatProviderError(`Error: ${error.message}`);
+    return classifyBaseApiError(error.message);
   }
   return new ChatProviderError(`Error: ${String(error)}`);
 }
@@ -151,53 +153,7 @@ export function isFunctionToolCall<T extends { type: string }>(
 ): tc is T & FunctionToolCallShape {
   return tc.type === 'function';
 }
-/**
- * Map kosong `ThinkingEffort` to OpenAI `reasoning_effort` string.
- */
-export function thinkingEffortToReasoningEffort(effort: ThinkingEffort): string | undefined {
-  switch (effort) {
-    case 'off':
-      return undefined;
-    case 'low':
-      return 'low';
-    case 'medium':
-      return 'medium';
-    case 'high':
-      return 'high';
-    case 'xhigh':
-    case 'max':
-      return 'xhigh';
-    default:
-      throw new Error(`Unknown thinking effort: ${String(effort)}`);
-  }
-}
 
-/**
- * Map OpenAI `reasoning_effort` string back to kosong `ThinkingEffort`.
- */
-export function reasoningEffortToThinkingEffort(
-  reasoning: string | undefined,
-): ThinkingEffort | null {
-  if (reasoning === undefined || reasoning === null) {
-    return null;
-  }
-  switch (reasoning) {
-    case 'low':
-    case 'minimal':
-      return 'low';
-    case 'medium':
-      return 'medium';
-    case 'high':
-      return 'high';
-    case 'xhigh':
-    case 'max':
-      return 'xhigh';
-    case 'none':
-      return 'off';
-    default:
-      return 'off';
-  }
-}
 /**
  * Extract `TokenUsage` from an OpenAI-compatible usage object.
  */
@@ -276,6 +232,18 @@ export function normalizeOpenAIFinishReason(raw: string | null | undefined): {
  * - `null`: convert content parts to the standard OpenAI content-part array.
  */
 export type ToolMessageConversion = 'extract_text' | null;
+
+/**
+ * Shared wording for tool-result media that cannot live inside the tool
+ * message itself and is reattached as a follow-up user message instead.
+ */
+export const TOOL_RESULT_MEDIA_PROMPT = 'Attached media from tool result:';
+export const TOOL_RESULT_MEDIA_PLACEHOLDER = '(see attached media)';
+
+/** A content part that is neither plain text nor reasoning. */
+export function isMediaPart(part: ContentPart): boolean {
+  return part.type !== 'text' && part.type !== 'think';
+}
 
 /**
  * Convert tool-role message content according to the chosen strategy.

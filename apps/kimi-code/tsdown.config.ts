@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import { defineConfig } from 'tsdown';
 
 import { rawTextPlugin } from '../../build/raw-text-plugin.mjs';
+import { BUILT_IN_CATALOG_DEFINE, builtInCatalogDefine } from './scripts/built-in-catalog.mjs';
 
 const appRoot = import.meta.dirname;
 
@@ -11,6 +12,8 @@ export default defineConfig({
   format: ['esm'],
   outDir: 'dist',
   clean: true,
+  dts: false,
+  hash: false,
   banner: {
     js: [
       '#!/usr/bin/env node',
@@ -24,8 +27,14 @@ export default defineConfig({
   alias: {
     '@': resolve(appRoot, 'src'),
   },
+  define: {
+    [BUILT_IN_CATALOG_DEFINE]: builtInCatalogDefine(),
+  },
   deps: {
-    alwaysBundle: [/^@moonshot-ai\//],
-    neverBundle: [],
+    onlyBundle: false,
+  },
+  outputOptions: {
+    codeSplitting: false,
+    entryFileNames: 'main.mjs',
   },
 });

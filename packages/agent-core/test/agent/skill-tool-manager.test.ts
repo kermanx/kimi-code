@@ -1,26 +1,21 @@
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join } from 'pathe';
 
-import { localKaos } from '@moonshot-ai/kaos';
 import { describe, expect, it, vi } from 'vitest';
 
-import { Agent } from '../../src/agent';
-import { ProviderManager } from '../../src/providers/provider-manager';
+import { Agent, type AgentRecord } from '../../src/agent';
+import { testKaos } from '../fixtures/test-kaos';
+import { InMemoryAgentRecordPersistence } from '../../src/agent/records';
+import type { AgentRecordPersistence } from '../../src/agent/records';
+import { ProviderManager } from '../../src/session/provider-manager';
 import type { ApprovalResponse, SDKAgentRPC, SDKSessionRPC } from '../../src/rpc';
 import { Session } from '../../src/session';
-import { SkillRegistry, type SkillDefinition } from '../../src/skill';
+import { SessionSkillRegistry, type SkillDefinition } from '../../src/skill';
+import type { SkillRegistry as AgentSkillRegistry } from '../../src/agent/skill';
 import { SkillTool } from '../../src/tools/builtin/collaboration/skill-tool';
-import type { Environment } from '../../src/utils/environment';
 import { executeTool } from '../tools/fixtures/execute-tool';
 
-const TEST_OS_ENV: Environment = {
-  osKind: 'Linux',
-  osArch: 'x86_64',
-  osVersion: 'test',
-  shellName: 'bash',
-  shellPath: '/bin/bash',
-};
 
 const MOCK_PROVIDER = {
   type: 'kimi',
@@ -40,7 +35,10 @@ function makeSkill(name: string, metadata: SkillDefinition['metadata'] = {}): Sk
   };
 }
 
-function makeAgent(skills?: SkillRegistry): Agent {
+function makeAgent(
+  skills?: AgentSkillRegistry,
+  persistence?: AgentRecordPersistence,
+): Agent {
   const rpc = {
     emitEvent: vi.fn(),
     requestApproval: vi.fn(),
@@ -48,13 +46,11 @@ function makeAgent(skills?: SkillRegistry): Agent {
     toolCall: vi.fn(),
   } as unknown as SDKAgentRPC;
   const agent = new Agent({
-    runtime: {
-      kaos: localKaos,
-      osEnv: TEST_OS_ENV,
-    },
+    kaos: testKaos,
     rpc,
     skills,
-    providerManager: testProviderManager(),
+    persistence,
+    modelProvider: testProviderManager(),
   });
   agent.config.update({
     cwd: process.cwd(),
@@ -65,10 +61,9 @@ function makeAgent(skills?: SkillRegistry): Agent {
   return agent;
 }
 
-function runtime() {
+function runtime(cwd?: string) {
   return {
-    kaos: localKaos,
-    osEnv: TEST_OS_ENV,
+    kaos: cwd === undefined ? testKaos : testKaos.withCwd(cwd),
   };
 }
 
@@ -110,7 +105,7 @@ describe('ToolManager SkillTool registration', () => {
   });
 
   it('does not expose Skill when there are no model-invocable skills', () => {
-    const skills = new SkillRegistry();
+    const skills = new SessionSkillRegistry();
     skills.register(makeSkill('private', { disableModelInvocation: true }));
 
     const agent = makeAgent(skills);
@@ -120,7 +115,7 @@ describe('ToolManager SkillTool registration', () => {
   });
 
   it('exposes Skill when at least one inline skill is model-invocable', () => {
-    const skills = new SkillRegistry();
+    const skills = new SessionSkillRegistry();
     skills.register(makeSkill('review'));
     skills.register(makeSkill('flow-only', { type: 'flow' }));
 
@@ -132,10 +127,33 @@ describe('ToolManager SkillTool registration', () => {
     expect(skillTool).toBeInstanceOf(SkillTool);
   });
 
-  it('persists model-invoked inline skill reminders through agent wire', async () => {
-    const skills = new SkillRegistry();
-    skills.register(makeSkill('review'));
+  it('accepts a structural skill registry implementation', () => {
+    const skill = makeSkill('review');
+    const skills: AgentSkillRegistry = {
+      getSkill: (name) => (name === skill.name ? skill : undefined),
+      getPluginSkill: () => undefined,
+      renderSkillPrompt: () => skill.content,
+      listInvocableSkills: () => [skill],
+      getSkillRoots: () => ['/skills/review'],
+      getModelSkillListing: () => '- review: desc for review',
+    };
+
     const agent = makeAgent(skills);
+
+    expect(agent.skills?.registry.getSkillRoots()).toEqual(['/skills/review']);
+    expect(agent.tools.loopTools.find((tool) => tool.name === 'Skill')).toBeInstanceOf(
+      SkillTool,
+    );
+  });
+
+  it('persists model-invoked inline skill reminders through agent wire', async () => {
+    const skills = new SessionSkillRegistry();
+    skills.register(makeSkill('review'));
+    const wireRecords: AgentRecord[] = [];
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record) => wireRecords.push(record),
+    });
+    const agent = makeAgent(skills, persistence);
     const skillTool = agent.tools.loopTools.find((tool) => tool.name === 'Skill');
     if (!(skillTool instanceof SkillTool)) {
       throw new Error('Expected SkillTool to be active');
@@ -149,16 +167,20 @@ describe('ToolManager SkillTool registration', () => {
     });
 
     expect(result.output).toContain('loaded inline');
-    expect(
-      agent.records.snapshot().find((record) => record.type === 'context.append_message'),
-    ).toMatchObject({
+    expect(wireRecords.find((record) => record.type === 'context.append_message')).toMatchObject({
       type: 'context.append_message',
       message: {
         role: 'user',
         content: [
           {
             type: 'text',
-            text: '<system-reminder>\n<kimi-skill-loaded name="review" args="">\nbody of review\n</kimi-skill-loaded>\n</system-reminder>',
+            text: [
+              'Skill tool loaded instructions for this request. Follow them.',
+              '',
+              '<kimi-skill-loaded name="review" trigger="model-tool" source="user" dir="/skills/review" args="">',
+              'body of review',
+              '</kimi-skill-loaded>',
+            ].join('\n'),
           },
         ],
         origin: {
@@ -191,15 +213,13 @@ describe('ToolManager SkillTool registration', () => {
 
       const session = new Session({
         id: 'test-skill-tool',
-        runtime: runtime(),
+        kaos: testKaos.withCwd(workDir),
         homedir: homeDir,
-        cwd: workDir,
         rpc: sessionRpc(),
         providerManager: testProviderManager(),
       });
       const mainAgent = await session.createMain();
       mainAgent.config.update({
-        cwd: workDir,
         modelAlias: MOCK_PROVIDER.model,
       });
       mainAgent.tools.initializeBuiltinTools();

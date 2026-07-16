@@ -28,7 +28,7 @@ import {
   EchoTool,
   FailingTool,
   GatedTool,
-  markReadAnyFileAccesses,
+  markReadFileAccesses,
   ProgressTool,
   StrictArgsTool,
 } from './fixtures/tools';
@@ -97,6 +97,96 @@ describe('runTurn — tool-call behaviour', () => {
     expect(trs[0]?.result.isError).toBeUndefined();
   });
 
+  it('preserves a tool result note through normalization into the recorded event', async () => {
+    const blocks = new ContentBlocksTool({
+      output: 'payload',
+      note: '<system>meta for the model</system>',
+    });
+    const { context } = await runTurn({
+      tools: [blocks],
+      responses: [
+        makeToolUseResponse([makeToolCall('blocks', {}, 'tc-note')]),
+        makeEndTurnResponse('done'),
+      ],
+    });
+
+    const result = context.toolResults()[0]?.result;
+    expect(result?.output).toBe('payload');
+    // note is part of the persisted result contract (unlike stopTurn/message,
+    // which normalization drops before the record is written).
+    expect(result?.note).toBe('<system>meta for the model</system>');
+  });
+
+  it('enforces the note contract (string | undefined) at the normalization boundary', async () => {
+    // Tools are arbitrary JS: a malformed note (null, number, object, empty
+    // string) must never reach the record — everything downstream (history,
+    // projection, vis) trusts the contract instead of re-validating.
+    const malformed = [null, 42, { text: 'x' }, ''];
+    const tools = malformed.map(
+      (note, i) =>
+        new ContentBlocksTool({ output: `payload-${String(i)}`, note } as never),
+    );
+    for (const [i, tool] of tools.entries()) {
+      Object.defineProperty(tool, 'name', { value: `blocks${String(i)}` });
+    }
+
+    const { context } = await runTurn({
+      tools,
+      responses: [
+        makeToolUseResponse(
+          tools.map((tool, i) => makeToolCall(tool.name, {}, `tc-bad-${String(i)}`)),
+        ),
+        makeEndTurnResponse('done'),
+      ],
+    });
+
+    const results = context.toolResults();
+    expect(results).toHaveLength(malformed.length);
+    for (const [i, entry] of results.entries()) {
+      expect(entry.result.output).toBe(`payload-${String(i)}`);
+      expect(entry.result.isError).toBeUndefined();
+      expect('note' in entry.result).toBe(false);
+    }
+  });
+
+  it('skips side-effecting tools when usage recording stops the turn', async () => {
+    const echo = new EchoTool();
+    const { result, sink, llm } = await runTurn({
+      tools: [echo],
+      responses: [makeToolUseResponse([makeToolCall('echo', { text: 'skip' }, 'tc-usage')])],
+      recordStepUsage: () => ({ stopTurn: true }),
+    });
+
+    expect(result.stopReason).toBe('end_turn');
+    expect(llm.callCount).toBe(1);
+    expect(echo.calls).toHaveLength(0);
+    expect(sink.byType('tool.call')).toHaveLength(0);
+    expect(sink.byType('tool.result')).toHaveLength(0);
+  });
+
+  it('skips later tool calls after a successful stop-turn result', async () => {
+    const stop = new StopSuccessTool();
+    const echo = new EchoTool();
+    const { result, sink, context } = await runTurn({
+      tools: [stop, echo],
+      responses: [
+        makeToolUseResponse([
+          makeToolCall('stop-success', {}, 'tc-stop'),
+          makeToolCall('echo', { text: 'must not run' }, 'tc-echo'),
+        ]),
+      ],
+    });
+
+    expect(result.stopReason).toBe('end_turn');
+    expect(stop.calls).toHaveLength(1);
+    expect(echo.calls).toHaveLength(0);
+    expect(sink.byType('tool.call').map((e) => e.toolCallId)).toEqual(['tc-stop', 'tc-echo']);
+    expect(sink.byType('tool.result').map((e) => e.toolCallId)).toEqual(['tc-stop', 'tc-echo']);
+    expect(context.toolResults()[0]?.result).toEqual({ output: 'stopped' });
+    expect(context.toolResults()[1]?.result).toMatchObject({ isError: true });
+    expect(context.toolResults()[1]?.result.output).toContain('skipped');
+  });
+
   it('passes toolCallId / turnId / args through to Tool.execute', async () => {
     const echo = new EchoTool();
     await runTurn({
@@ -132,6 +222,7 @@ describe('runTurn — tool-call behaviour', () => {
     const tcRow = context.toolCalls();
     const trRow = context.toolResults();
     expect(tcRow.length).toBe(1);
+    expect(tcRow[0]?.args).toEqual({ x: 1 });
     expect(trRow.length).toBe(1);
     expect(trRow[0]?.result.isError).toBe(true);
   });
@@ -153,7 +244,7 @@ describe('runTurn — tool-call behaviour', () => {
     expect(expectTextOutput(results[0]?.result.output).toLowerCase()).toContain('invalid args');
   });
 
-  it('records an error tool.result when LLM-side args parsing already failed', async () => {
+  it('falls back to schema validation when LLM-side args parsing fails', async () => {
     const echo = new EchoTool();
     const { sink } = await runTurn({
       tools: [echo],
@@ -162,10 +253,8 @@ describe('runTurn — tool-call behaviour', () => {
           {
             type: 'function',
             id: 'tc-1',
-            function: {
-              name: 'echo',
-              arguments: '{',
-            },
+            name: 'echo',
+            arguments: '{}{',
           },
         ]),
         makeEndTurnResponse('done'),
@@ -176,7 +265,38 @@ describe('runTurn — tool-call behaviour', () => {
     const results = sink.byType('tool.result');
     expect(results.length).toBe(1);
     expect(results[0]?.result.isError).toBe(true);
-    expect(results[0]?.result.output).toContain('malformed JSON in arguments');
+    const output = expectTextOutput(results[0]?.result.output);
+    expect(output).toContain('Invalid args');
+    expect(output).toContain("must have required property 'text'");
+    expect(output).not.toContain('malformed JSON in arguments');
+    expect(output).not.toContain('Expected arguments schema:');
+  });
+
+  it('does not repair malformed tool args JSON', async () => {
+    const echo = new EchoTool();
+    const { sink } = await runTurn({
+      tools: [echo],
+      responses: [
+        makeToolUseResponse([
+          {
+            type: 'function',
+            id: 'tc-1',
+            name: 'echo',
+            arguments: '{"text":"hi",}',
+          },
+        ]),
+        makeEndTurnResponse('done'),
+      ],
+    });
+
+    expect(echo.calls).toHaveLength(0);
+
+    const results = sink.byType('tool.result');
+    expect(results.length).toBe(1);
+    expect(results[0]?.result.isError).toBe(true);
+    const output = expectTextOutput(results[0]?.result.output);
+    expect(output).toContain('Invalid args');
+    expect(output).toContain("must have required property 'text'");
   });
 
   it('captures tool execution failures as error results', async () => {
@@ -219,6 +339,111 @@ describe('runTurn — tool-call behaviour', () => {
         }),
       }),
     );
+  });
+
+  it('coerces an undefined tool return into an error tool.result without breaking pairing', async () => {
+    const undef: ExecutableTool = {
+      name: 'undef',
+      description: 'returns undefined',
+      parameters: { type: 'object', additionalProperties: true },
+      resolveExecution: () => ({
+        approvalRule: 'undef',
+        execute: async () => undefined as unknown as ExecutableToolResult,
+      }),
+    };
+    const { sink, context } = await runTurn({
+      tools: [undef],
+      responses: [
+        makeToolUseResponse([makeToolCall('undef', {}, 'tc-U')]),
+        makeEndTurnResponse('done'),
+      ],
+    });
+    const callIds = sink.byType('tool.call').map((e) => e.toolCallId);
+    const resultIds = sink.byType('tool.result').map((e) => e.toolCallId);
+    expect(resultIds).toEqual(callIds);
+    const result = context.toolResults()[0]?.result;
+    expect(result?.isError).toBe(true);
+    expect(expectTextOutput(result?.output)).toContain('Tool "undef" returned no result');
+  });
+
+  it('coerces a tool returning an object without "output" into an error tool.result', async () => {
+    const noout: ExecutableTool = {
+      name: 'noout',
+      description: 'returns {}',
+      parameters: { type: 'object', additionalProperties: true },
+      resolveExecution: () => ({
+        approvalRule: 'noout',
+        execute: async () => ({}) as ExecutableToolResult,
+      }),
+    };
+    const { sink, context } = await runTurn({
+      tools: [noout],
+      responses: [
+        makeToolUseResponse([makeToolCall('noout', {}, 'tc-N')]),
+        makeEndTurnResponse('done'),
+      ],
+    });
+    expect(sink.byType('tool.result').length).toBe(1);
+    const result = context.toolResults()[0]?.result;
+    expect(result?.isError).toBe(true);
+    expect(expectTextOutput(result?.output)).toContain('missing or malformed "output" field');
+  });
+
+  it('keeps every tool.call paired when one parallel tool returns a corrupt result', async () => {
+    const undef: ExecutableTool = {
+      name: 'undef',
+      description: 'returns undefined',
+      parameters: { type: 'object', additionalProperties: true },
+      resolveExecution: () => ({
+        approvalRule: 'undef',
+        execute: async () => undefined as unknown as ExecutableToolResult,
+      }),
+    };
+    const echo = new EchoTool();
+    const { sink, context } = await runTurn({
+      tools: [undef, echo],
+      responses: [
+        makeToolUseResponse([
+          makeToolCall('undef', {}, 'tc-U'),
+          makeToolCall('echo', { text: 'a' }, 'tc-E1'),
+          makeToolCall('echo', { text: 'b' }, 'tc-E2'),
+        ]),
+        makeEndTurnResponse('done'),
+      ],
+    });
+    const callIds = sink
+      .byType('tool.call')
+      .map((e) => e.toolCallId)
+      .toSorted();
+    const resultIds = sink
+      .byType('tool.result')
+      .map((e) => e.toolCallId)
+      .toSorted();
+    expect(callIds).toEqual(['tc-E1', 'tc-E2', 'tc-U']);
+    expect(resultIds).toEqual(callIds);
+    expect(context.toolResults().find((r) => r.toolCallId === 'tc-U')?.result.isError).toBe(true);
+    expect(context.toolResults().find((r) => r.toolCallId === 'tc-E1')?.result.isError).not.toBe(
+      true,
+    );
+  });
+
+  it('coerces a corrupt finalizeToolResult hook return into an error result', async () => {
+    const echo = new EchoTool();
+    const hooks: LoopHooks = {
+      finalizeToolResult: async () => ({}) as ExecutableToolResult,
+    };
+    const { sink, context } = await runTurn({
+      tools: [echo],
+      hooks,
+      responses: [
+        makeToolUseResponse([makeToolCall('echo', { text: 'hi' }, 'tc-E')]),
+        makeEndTurnResponse('done'),
+      ],
+    });
+    expect(sink.byType('tool.result').length).toBe(1);
+    const result = context.toolResults()[0]?.result;
+    expect(result?.isError).toBe(true);
+    expect(expectTextOutput(result?.output)).toContain('missing or malformed "output" field');
   });
 
   it('does not duplicate prepare hook failures in the diagnostic log', async () => {
@@ -306,8 +531,8 @@ describe('runTurn — tool-call behaviour', () => {
     // Two GatedTools start, each blocks until released. If the loop executed
     // them serially we could not have both `started` promises resolve
     // before releasing either.
-    const a = markReadAnyFileAccesses(new GatedTool('gated-a'));
-    const b = markReadAnyFileAccesses(new GatedTool('gated-b'));
+    const a = markReadFileAccesses(new GatedTool('gated-a'));
+    const b = markReadFileAccesses(new GatedTool('gated-b'));
 
     const turnPromise = runTurn({
       tools: [a, b],
@@ -576,6 +801,7 @@ class PathLockedGatedTool implements ExecutableTool<PathLockedInput> {
   resolveExecution(input: PathLockedInput): ToolExecution {
     return {
       accesses: ToolAccesses.writeFile(input.path),
+      approvalRule: this.name,
       execute: async (ctx): Promise<ExecutableToolResult> => {
         this.calls.push({
           id: ctx.toolCallId,
@@ -629,5 +855,26 @@ class PathSecurityTool implements ExecutableTool<Record<string, unknown>> {
       '/secret',
       'Path is outside workspace.',
     );
+  }
+}
+
+class StopSuccessTool implements ExecutableTool<Record<string, unknown>> {
+  readonly name = 'stop-success';
+  readonly description = 'Returns a successful result that stops the turn.';
+  readonly parameters: Record<string, unknown> = {
+    type: 'object',
+    additionalProperties: true,
+  };
+  readonly calls: Array<{ readonly id: string }> = [];
+
+  resolveExecution(): ToolExecution {
+    return {
+      stopBatchAfterThis: true,
+      approvalRule: this.name,
+      execute: async (ctx): Promise<ExecutableToolResult> => {
+        this.calls.push({ id: ctx.toolCallId });
+        return { output: 'stopped', stopTurn: true };
+      },
+    };
   }
 }

@@ -1,14 +1,23 @@
-import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, realpath as fsRealpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import path from 'node:path';
+import path from 'pathe';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { discoverSkills, resolveSkillRoots, SkillRegistry, type SkillRoot } from '../../src/skill';
+import { discoverSkills, resolveSkillRoots, SessionSkillRegistry, type SkillRoot } from '../../src/skill';
+
+// Mirror `resolveSkillRoots`' internal realpath (fs.realpath + forward-slash
+// normalization, see scanner.ts) so `root.path` comparisons hold on Windows,
+// where `node:fs.realpath` returns backslashes. Every test in this file
+// compares against `root.path`, so the helper must match that exact form.
+async function realpath(p: string): Promise<string> {
+  return (await fsRealpath(p)).replaceAll('\\', '/');
+}
 
 const tempDirs: string[] = [];
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   for (const dir of tempDirs.splice(0)) {
     await rm(dir, { recursive: true, force: true });
   }
@@ -137,7 +146,7 @@ describe('skill discovery', () => {
       '```',
     ]);
 
-    const registry = new SkillRegistry();
+    const registry = new SessionSkillRegistry();
     await registry.loadRoots([{ path: projectRoot, source: 'project' }]);
 
     expect(registry.listSkills().map((skill) => skill.name)).toEqual(['review-flow']);
@@ -335,25 +344,116 @@ describe('discoverSkills shape and ordering', () => {
     expect(skills.map((s) => s.name)).toEqual(['alpha', 'beta', 'top']);
   });
 
-  it('does not descend into a skill bundle subdirectory', async () => {
+  it('discovers nested SKILL.md files inside a skill bundle when has-sub-skill is declared', async () => {
     const { repoDir } = await makeWorkspace();
     const root = path.join(repoDir, '.kimi-code', 'skills');
     await writeSkill(root, path.join('outer', 'SKILL.md'), [
       '---',
       'name: outer',
-      'description: The real skill',
+      'description: Parent skill',
+      'has-sub-skill: true',
       '---',
+      '',
+      'Outer body.',
     ]);
     await writeSkill(root, path.join('outer', 'references', 'inner', 'SKILL.md'), [
       '---',
       'name: inner',
-      'description: Should be ignored',
+      'description: Nested skill',
       '---',
+      '',
+      'Inner body should stay private until activation.',
+    ]);
+    await writeFile(
+      path.join(root, 'outer', 'references', 'notes.md'),
+      'Nested payload should not be listed.',
+    );
+
+    const skills = await discoverSkills({ roots: [{ path: root, source: 'user' }] });
+
+    expect(skills.map((s) => s.name)).toEqual(['outer', 'outer.inner']);
+    expect(skills.find((s) => s.name === 'outer')?.metadata.isSubSkill).toBeUndefined();
+    expect(skills.find((s) => s.name === 'outer.inner')?.metadata.isSubSkill).toBe(true);
+  });
+
+  it('does not discover nested SKILL.md files when the parent bundle disables sub-skills', async () => {
+    const { repoDir } = await makeWorkspace();
+    const root = path.join(repoDir, '.kimi-code', 'skills');
+    await writeSkill(root, path.join('outer', 'SKILL.md'), [
+      '---',
+      'name: outer',
+      'description: Parent skill',
+      '---',
+      '',
+      'Outer body.',
+    ]);
+    await writeSkill(root, path.join('outer', 'references', 'inner', 'SKILL.md'), [
+      '---',
+      'name: inner',
+      'description: Nested skill',
+      '---',
+      '',
+      'Inner body should stay private until activation.',
     ]);
 
     const skills = await discoverSkills({ roots: [{ path: root, source: 'user' }] });
 
     expect(skills.map((s) => s.name)).toEqual(['outer']);
+  });
+
+  it('discovers nested SKILL.md files when has-sub-skill is nested under metadata', async () => {
+    const { repoDir } = await makeWorkspace();
+    const root = path.join(repoDir, '.kimi-code', 'skills');
+    await writeSkill(root, path.join('outer', 'SKILL.md'), [
+      '---',
+      'name: outer',
+      'description: Parent skill',
+      'metadata:',
+      '  has-sub-skill: true',
+      '---',
+      '',
+      'Outer body.',
+    ]);
+    await writeSkill(root, path.join('outer', 'inner', 'SKILL.md'), [
+      '---',
+      'name: outer.inner',
+      'description: Nested skill',
+      '---',
+      '',
+      'Inner body.',
+    ]);
+
+    const skills = await discoverSkills({ roots: [{ path: root, source: 'user' }] });
+
+    expect(skills.map((s) => s.name)).toEqual(['outer', 'outer.inner']);
+  });
+
+  it('discovers declared sub-skills without a feature flag', async () => {
+    const { repoDir } = await makeWorkspace();
+    const root = path.join(repoDir, '.kimi-code', 'skills');
+    await writeSkill(root, path.join('outer', 'SKILL.md'), [
+      '---',
+      'name: outer',
+      'description: Parent skill',
+      'has-sub-skill: true',
+      '---',
+      '',
+      'Outer body.',
+    ]);
+    await writeSkill(root, path.join('outer', 'inner', 'SKILL.md'), [
+      '---',
+      'name: outer.inner',
+      'description: Nested skill',
+      '---',
+      '',
+      'Inner body.',
+    ]);
+
+    const skills = await discoverSkills({
+      roots: [{ path: root, source: 'user' }],
+    });
+
+    expect(skills.map((s) => s.name)).toEqual(['outer', 'outer.inner']);
   });
 
   it('skips node_modules when scanning nested directories', async () => {
@@ -578,6 +678,54 @@ describe('resolveSkillRoots ordering and priority', () => {
   });
 });
 
+describe('resolveSkillRoots brand home (KIMI_CODE_HOME)', () => {
+  it('resolves the user brand skills root under brandHomeDir while keeping generic under the real home', async () => {
+    const { homeDir, workDir } = await makeWorkspace();
+    const brandHomeDir = path.join(homeDir, '..', 'brand-home');
+    await mkdir(path.join(brandHomeDir, 'skills'), { recursive: true });
+    await mkdir(path.join(homeDir, '.agents', 'skills'), { recursive: true });
+
+    const roots = await resolveSkillRoots({
+      paths: { userHomeDir: homeDir, brandHomeDir, workDir },
+    });
+
+    const userRoots = roots.filter((r) => r.source === 'user').map((r) => r.path);
+    expect(userRoots).toContain(await realpath(path.join(brandHomeDir, 'skills')));
+    expect(userRoots).toContain(await realpath(path.join(homeDir, '.agents', 'skills')));
+  });
+
+  it('never nests a second .kimi-code under the brand home', async () => {
+    const { homeDir, workDir } = await makeWorkspace();
+    // Mirrors the default case where brandHomeDir already IS the ~/.kimi-code dir.
+    const brandHomeDir = path.join(homeDir, '.kimi-code');
+    await mkdir(path.join(brandHomeDir, 'skills'), { recursive: true });
+    // The doubled-prefix path that must never be selected.
+    await mkdir(path.join(brandHomeDir, '.kimi-code', 'skills'), { recursive: true });
+
+    const roots = await resolveSkillRoots({
+      paths: { userHomeDir: homeDir, brandHomeDir, workDir },
+    });
+
+    const userRoots = roots.filter((r) => r.source === 'user').map((r) => r.path);
+    expect(userRoots).toContain(await realpath(path.join(brandHomeDir, 'skills')));
+    expect(userRoots).not.toContain(
+      await realpath(path.join(brandHomeDir, '.kimi-code', 'skills')),
+    );
+  });
+
+  it('falls back to <userHomeDir>/.kimi-code/skills when brandHomeDir is omitted', async () => {
+    const { homeDir, workDir } = await makeWorkspace();
+    await mkdir(path.join(homeDir, '.kimi-code', 'skills'), { recursive: true });
+
+    const roots = await resolveSkillRoots({
+      paths: { userHomeDir: homeDir, workDir },
+    });
+
+    const userRoots = roots.filter((r) => r.source === 'user').map((r) => r.path);
+    expect(userRoots).toContain(await realpath(path.join(homeDir, '.kimi-code', 'skills')));
+  });
+});
+
 describe('resolveSkillRoots extra dirs', () => {
   it('appends extra dirs to the resolved roots', async () => {
     const { homeDir, repoDir, workDir } = await makeWorkspace();
@@ -663,6 +811,72 @@ describe('resolveSkillRoots extra dirs', () => {
     const realResolved = await realpath(real);
     const matches = roots.filter((r) => r.path === realResolved);
     expect(matches).toHaveLength(1);
+  });
+
+  it('preserves plugin metadata when a plugin skill root duplicates an extra dir', async () => {
+    const { homeDir, repoDir, workDir } = await makeWorkspace();
+    const real = path.join(repoDir, 'real');
+    await mkdir(real, { recursive: true });
+
+    const roots = await resolveSkillRoots({
+      paths: { userHomeDir: homeDir, workDir },
+      extraDirs: [real],
+      pluginSkillRoots: [
+        {
+          path: real,
+          source: 'extra',
+          plugin: {
+            id: 'superpowers',
+            instructions: 'Use AskUserQuestion.',
+          },
+        },
+      ],
+    });
+
+    const realResolved = await realpath(real);
+    const matches = roots.filter((r) => r.path === realResolved);
+    expect(matches).toHaveLength(1);
+    expect(matches[0]?.plugin).toEqual({
+      id: 'superpowers',
+      instructions: 'Use AskUserQuestion.',
+    });
+  });
+
+  it('keeps plugin-specific skill lookup when a project skill has the same name', async () => {
+    const { repoDir } = await makeWorkspace();
+    const projectRoot = path.join(repoDir, '.kimi-code', 'skills');
+    const pluginRoot = path.join(repoDir, 'plugin-skills');
+    await writeSkill(projectRoot, path.join('using-superpowers', 'SKILL.md'), [
+      '---',
+      'name: using-superpowers',
+      'description: Project override',
+      '---',
+      '',
+      'project body',
+    ]);
+    await writeSkill(pluginRoot, path.join('using-superpowers', 'SKILL.md'), [
+      '---',
+      'name: using-superpowers',
+      'description: Plugin startup',
+      '---',
+      '',
+      'plugin body',
+    ]);
+    const registry = new SessionSkillRegistry();
+
+    await registry.loadRoots([
+      { path: projectRoot, source: 'project' },
+      {
+        path: pluginRoot,
+        source: 'extra',
+        plugin: { id: 'superpowers' },
+      },
+    ]);
+
+    expect(registry.getSkill('using-superpowers')?.content).toBe('project body');
+    expect(registry.getPluginSkill('superpowers', 'using-superpowers')?.content).toBe(
+      'plugin body',
+    );
   });
 
   it('stamps skills discovered via extra dirs with source=extra', async () => {

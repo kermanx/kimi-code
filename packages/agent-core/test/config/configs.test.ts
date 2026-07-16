@@ -1,18 +1,23 @@
 import { mkdtempSync } from 'node:fs';
 import { readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join } from 'pathe';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { ErrorCodes, KimiError } from '../../src/errors';
 import {
   KimiConfigSchema,
+  applyPrintModeConfigDefaults,
+  configToTomlData,
   ensureConfigFile,
+  loadRuntimeConfig,
+  loadRuntimeConfigSafe,
   mergeConfigPatch,
   parseConfigString,
   parseBooleanEnv,
   readConfigFile,
+  readConfigFileForUpdate,
   resolveConfigPath,
   resolveConfigValue,
   resolveKimiHome,
@@ -47,7 +52,6 @@ function expectKimiErrorCode(fn: () => unknown, code: string): void {
 
 const COMPLETE_TOML = `
 default_model = "kimi-code/kimi-for-coding"
-default_thinking = true
 default_permission_mode = "auto"
 default_plan_mode = false
 merge_all_available_skills = true
@@ -72,7 +76,7 @@ capabilities = ["image_in", "thinking", "video_in"]
 display_name = "Kimi for Coding"
 
 [thinking]
-mode = "auto"
+enabled = true
 effort = "medium"
 
 [permission]
@@ -98,9 +102,16 @@ compaction_trigger_ratio = 0.85
 [background]
 max_running_tasks = 4
 keep_alive_on_exit = false
+bash_auto_background_on_timeout = false
 kill_grace_period_ms = 2000
-agent_task_timeout_s = 900
 print_wait_ceiling_s = 3600
+
+[subagent]
+timeout_ms = 600000
+
+[image]
+max_edge_px = 1500
+read_byte_budget = 131072
 
 [[hooks]]
 event = "PreToolUse"
@@ -130,7 +141,7 @@ describe('harness config TOML loader', () => {
     const config = parseConfigString(COMPLETE_TOML, 'config.toml');
 
     expect(config.defaultModel).toBe('kimi-code/kimi-for-coding');
-    expect(config.defaultThinking).toBe(true);
+    expect(config.thinking?.enabled).toBe(true);
     expect(config.defaultPermissionMode).toBe('auto');
     expect(config.defaultPlanMode).toBe(false);
     expect(config.mergeAllAvailableSkills).toBe(true);
@@ -150,7 +161,7 @@ describe('harness config TOML loader', () => {
       capabilities: ['image_in', 'thinking', 'video_in'],
       displayName: 'Kimi for Coding',
     });
-    expect(config.thinking).toEqual({ mode: 'auto', effort: 'medium' });
+    expect(config.thinking).toEqual({ enabled: true, effort: 'medium' });
     expect(config.permission).toEqual({
       rules: [
         {
@@ -173,7 +184,15 @@ describe('harness config TOML loader', () => {
       reservedContextSize: 50000,
       compactionTriggerRatio: 0.85,
     });
-    expect(config.background?.agentTaskTimeoutS).toBe(900);
+    expect(config.background).toMatchObject({
+      maxRunningTasks: 4,
+      keepAliveOnExit: false,
+      bashAutoBackgroundOnTimeout: false,
+      killGracePeriodMs: 2000,
+      printWaitCeilingS: 3600,
+    });
+    expect(config.subagent).toMatchObject({ timeoutMs: 600000 });
+    expect(config.image).toEqual({ maxEdgePx: 1500, readByteBudget: 131072 });
     expect(config.hooks).toEqual([
       {
         event: 'PreToolUse',
@@ -192,6 +211,127 @@ describe('harness config TOML loader', () => {
     expect('theme' in config).toBe(false);
     expect(config.raw?.['theme']).toBe('dark');
     expect(config.raw?.['notifications']).toEqual({ claim_stale_after_ms: 15000 });
+  });
+
+  it('round-trips the [image] section', async () => {
+    const dir = makeTempDir();
+    const configPath = join(dir, 'image-round-trip.toml');
+    const toml = `
+[image]
+max_edge_px = 2500
+read_byte_budget = 524288
+`;
+    const config = parseConfigString(toml, configPath);
+    expect(config.image).toEqual({ maxEdgePx: 2500, readByteBudget: 524288 });
+
+    await writeConfigFile(configPath, config);
+    const text = await readFile(configPath, 'utf-8');
+    const roundTripped = parseConfigString(text, configPath);
+    expect(roundTripped.image).toEqual({ maxEdgePx: 2500, readByteBudget: 524288 });
+  });
+
+  it('round-trips a custom registry source field on a provider', async () => {
+    const dir = makeTempDir();
+    const configPath = join(dir, 'round-trip.toml');
+    const toml = `
+[providers.custom]
+type = "openai"
+base_url = "https://custom.example/v1"
+api_key = "sk-test"
+source = { kind = "apiJson", url = "https://registry.example/api.json", apiKey = "sk-registry" }
+`;
+    const config = parseConfigString(toml, configPath);
+    expect(config.providers['custom']).toMatchObject({
+      type: 'openai',
+      baseUrl: 'https://custom.example/v1',
+      apiKey: 'sk-test',
+      source: { kind: 'apiJson', url: 'https://registry.example/api.json', apiKey: 'sk-registry' },
+    });
+
+    await writeConfigFile(configPath, config);
+    const text = await readFile(configPath, 'utf-8');
+    const roundTripped = parseConfigString(text, configPath);
+    expect(roundTripped.providers['custom']?.source).toEqual({
+      kind: 'apiJson',
+      url: 'https://registry.example/api.json',
+      apiKey: 'sk-registry',
+    });
+  });
+
+  it('round-trips OAuth refs with scoped OAuth hosts', async () => {
+    const dir = makeTempDir();
+    const configPath = join(dir, 'oauth-ref.toml');
+    const toml = `
+[providers."managed:kimi-code"]
+type = "kimi"
+base_url = "https://api.dev.example.test/coding/v1"
+api_key = ""
+oauth = { storage = "file", key = "oauth/kimi-code-env-1234", oauth_host = "https://auth.dev.example.test" }
+
+[services.moonshot_search]
+base_url = "https://api.dev.example.test/coding/v1/search"
+api_key = ""
+oauth = { storage = "file", key = "oauth/kimi-code-env-1234", oauth_host = "https://auth.dev.example.test" }
+`;
+    const config = parseConfigString(toml, configPath);
+    expect(config.providers['managed:kimi-code']?.oauth).toEqual({
+      storage: 'file',
+      key: 'oauth/kimi-code-env-1234',
+      oauthHost: 'https://auth.dev.example.test',
+    });
+    expect(config.services?.moonshotSearch?.oauth?.oauthHost).toBe('https://auth.dev.example.test');
+
+    await writeConfigFile(configPath, config);
+    const text = await readFile(configPath, 'utf-8');
+    expect(text).toContain('oauth_host = "https://auth.dev.example.test"');
+    const roundTripped = parseConfigString(text, configPath);
+    expect(roundTripped.providers['managed:kimi-code']?.oauth?.oauthHost).toBe(
+      'https://auth.dev.example.test',
+    );
+  });
+
+  it('parses and round-trips experimental feature flags', async () => {
+    const dir = makeTempDir();
+    const configPath = join(dir, 'experimental.toml');
+    const toml = `
+[experimental]
+micro_compaction = false
+`;
+    const config = parseConfigString(toml, configPath);
+
+    expect(config.experimental).toEqual({
+      'micro_compaction': false,
+    });
+
+    await writeConfigFile(configPath, config);
+    const text = await readFile(configPath, 'utf-8');
+
+    expect(text).toContain('[experimental]');
+    expect(text).toContain('micro_compaction = false');
+    expect(parseConfigString(text, configPath).experimental).toEqual(config.experimental);
+  });
+
+  it('accepts obsolete experimental feature keys as inert config', async () => {
+    const dir = makeTempDir();
+    const configPath = join(dir, 'obsolete-experimental.toml');
+    const toml = `
+[experimental]
+legacy_feature = true
+obsolete_feature = false
+removed_flag = true
+`;
+
+    const config = parseConfigString(toml, configPath);
+
+    expect(config.experimental).toEqual({
+      'legacy_feature': true,
+      'obsolete_feature': false,
+      'removed_flag': true,
+    });
+
+    await writeConfigFile(configPath, config);
+    const text = await readFile(configPath, 'utf-8');
+    expect(parseConfigString(text, configPath).experimental).toEqual(config.experimental);
   });
 
   it('loads defaults for absent files and writes typed fields without dropping raw sections', async () => {
@@ -250,7 +390,7 @@ describe('harness config TOML loader', () => {
     const config = readConfigFile(configPath);
     expect(config.providers).toEqual({});
     expect(config.defaultModel).toBeUndefined();
-    expect(config.defaultThinking).toBeUndefined();
+    expect(config.thinking?.enabled).toBeUndefined();
   });
 
   it('does not overwrite an existing config file', async () => {
@@ -390,9 +530,26 @@ describe('harness config schema and patch merge', () => {
       maxContextSize: 262144,
       capabilities: ['tool_use'],
     });
-    expect(merged.thinking).toEqual({ mode: 'auto', effort: 'high' });
+    expect(merged.thinking).toEqual({ enabled: true, effort: 'high' });
     expect(merged.hooks).toEqual(base.hooks);
     expect(merged.raw?.['theme']).toBe('dark');
+  });
+
+  it('deep-merges experimental config patches', () => {
+    const base = parseConfigString(`
+[experimental]
+micro_compaction = false
+`);
+
+    const merged = mergeConfigPatch(base, {
+      experimental: {
+        'micro_compaction': true,
+      },
+    });
+
+    expect(merged.experimental).toEqual({
+      'micro_compaction': true,
+    });
   });
 
   it('rejects unknown fields in config patches', () => {
@@ -534,5 +691,272 @@ describe('config value env override helpers', () => {
         parseEnv: parseBooleanEnv,
       }),
     ).toBe(false);
+  });
+});
+
+describe('loadRuntimeConfigSafe', () => {
+  const VALID_TOML = `
+default_model = "k2"
+
+[providers.kimi]
+type = "kimi"
+api_key = "sk-good"
+
+[models.k2]
+provider = "kimi"
+model = "kimi-for-coding"
+max_context_size = 128000
+`;
+
+  async function writeTempConfig(text: string): Promise<string> {
+    const configPath = join(makeTempDir(), 'config.toml');
+    await writeFile(configPath, text, 'utf-8');
+    return configPath;
+  }
+
+  it('loads a valid file with no warnings, matching the strict loader', async () => {
+    const configPath = await writeTempConfig(VALID_TOML);
+    const result = loadRuntimeConfigSafe(configPath, {});
+    expect(result.fileWarnings).toEqual([]);
+    expect(result.envWarnings).toEqual([]);
+    expect(result.config).toEqual(loadRuntimeConfig(configPath, {}));
+  });
+
+  it('returns defaults with no warnings when the file is missing', () => {
+    const configPath = join(makeTempDir(), 'config.toml');
+    const result = loadRuntimeConfigSafe(configPath, {});
+    expect(result.fileWarnings).toEqual([]);
+    expect(result.envWarnings).toEqual([]);
+    expect(result.config.providers).toEqual({});
+  });
+
+  it('reports a fileError and defaults on invalid TOML syntax', async () => {
+    const configPath = await writeTempConfig('[[[');
+    const result = loadRuntimeConfigSafe(configPath, {});
+    expect(result.config.providers).toEqual({});
+    // The whole file is unusable: callers decide to fail startup (fileError)
+    // or keep the last good config mid-run (fileWarnings).
+    expect(result.fileError).toBeInstanceOf(KimiError);
+    expect(result.fileError?.code).toBe(ErrorCodes.CONFIG_INVALID);
+    expect(result.fileError?.message).toContain('Invalid TOML');
+    expect(result.fileError?.message).toContain(configPath);
+    expect(result.fileWarnings).toHaveLength(1);
+    const warning = result.fileWarnings[0]!;
+    expect(warning).toContain('Invalid TOML');
+    // Single-line summary with the error location, not the multi-line code frame.
+    expect(warning).not.toContain('\n');
+    expect(warning).toContain('line 1');
+  });
+
+  it('does not set fileError when only sections are dropped', async () => {
+    const configPath = await writeTempConfig(`${VALID_TOML}
+[loop_control]
+max_steps_per_turn = "nope"
+`);
+    const result = loadRuntimeConfigSafe(configPath, {});
+    expect(result.fileError).toBeUndefined();
+    expect(result.fileWarnings).toHaveLength(1);
+  });
+
+  it('drops only an invalid section on schema errors and keeps the rest', async () => {
+    const configPath = await writeTempConfig(`${VALID_TOML}
+[loop_control]
+max_steps_per_turn = "not-a-number"
+`);
+    const result = loadRuntimeConfigSafe(configPath, {});
+    expect(result.config.loopControl).toBeUndefined();
+    expect(result.config.providers['kimi']).toMatchObject({ type: 'kimi', apiKey: 'sk-good' });
+    expect(result.config.models?.['k2']).toMatchObject({ maxContextSize: 128000 });
+    expect(result.config.defaultModel).toBe('k2');
+    expect(result.fileWarnings).toHaveLength(1);
+    expect(result.fileWarnings[0]).toContain('loop_control');
+    // The original file content stays visible in raw so nothing is lost.
+    expect(result.config.raw?.['loop_control']).toEqual({ max_steps_per_turn: 'not-a-number' });
+  });
+
+  it('drops only the broken provider entry, keeping other providers', async () => {
+    const configPath = await writeTempConfig(`${VALID_TOML}
+[providers.bad]
+type = "not-a-provider"
+`);
+    const result = loadRuntimeConfigSafe(configPath, {});
+    expect(result.config.providers['bad']).toBeUndefined();
+    expect(result.config.providers['kimi']).toMatchObject({ type: 'kimi' });
+    expect(result.fileWarnings).toHaveLength(1);
+    expect(result.fileWarnings[0]).toContain('providers.bad');
+  });
+
+  it('keeps other providers when one entry has multiple validation issues', async () => {
+    // Two issues on the same entry: the second must not escalate to
+    // deleting the whole providers section after the first dropped the entry.
+    const configPath = await writeTempConfig(`${VALID_TOML}
+[providers.bad]
+type = "not-a-provider"
+api_key = 123
+`);
+    const result = loadRuntimeConfigSafe(configPath, {});
+    expect(result.config.providers['bad']).toBeUndefined();
+    expect(result.config.providers['kimi']).toMatchObject({ type: 'kimi' });
+    expect(result.fileWarnings).toHaveLength(1);
+    expect(result.fileWarnings[0]).toContain('providers.bad');
+    expect(result.fileWarnings[0]).not.toMatch(/providers[,.]? /);
+  });
+
+  it('drops only the broken model entry', async () => {
+    const configPath = await writeTempConfig(`${VALID_TOML}
+[models.broken]
+provider = "kimi"
+model = "x"
+max_context_size = -5
+`);
+    const result = loadRuntimeConfigSafe(configPath, {});
+    expect(result.config.models?.['broken']).toBeUndefined();
+    expect(result.config.models?.['k2']).toBeDefined();
+    expect(result.fileWarnings[0]).toContain('models.broken');
+  });
+
+  it('drops the whole hooks list when one hook is invalid', async () => {
+    const configPath = await writeTempConfig(`${VALID_TOML}
+[[hooks]]
+event = "NotARealEvent"
+command = "echo hi"
+`);
+    const result = loadRuntimeConfigSafe(configPath, {});
+    expect(result.config.hooks).toBeUndefined();
+    expect(result.config.providers['kimi']).toBeDefined();
+    expect(result.fileWarnings[0]).toContain('hooks');
+  });
+
+  it('reports every dropped section in the warning', async () => {
+    const configPath = await writeTempConfig(`${VALID_TOML}
+[loop_control]
+max_steps_per_turn = "nope"
+
+[background]
+max_running_tasks = 0
+`);
+    const result = loadRuntimeConfigSafe(configPath, {});
+    expect(result.config.loopControl).toBeUndefined();
+    expect(result.config.background).toBeUndefined();
+    expect(result.fileWarnings).toHaveLength(1);
+    expect(result.fileWarnings[0]).toContain('loop_control');
+    expect(result.fileWarnings[0]).toContain('background');
+  });
+
+  it('applies KIMI_MODEL_* env overrides on top of a salvaged config', async () => {
+    const configPath = await writeTempConfig(`${VALID_TOML}
+[loop_control]
+max_steps_per_turn = "nope"
+`);
+    const result = loadRuntimeConfigSafe(configPath, {
+      KIMI_MODEL_NAME: 'env-model',
+      KIMI_MODEL_API_KEY: 'sk-env',
+      KIMI_MODEL_MAX_CONTEXT_SIZE: '262144',
+    });
+    expect(result.envWarnings).toEqual([]);
+    expect(result.config.models?.['__kimi_env_model__']).toBeDefined();
+    expect(result.config.providers['kimi']).toBeDefined();
+    expect(result.fileWarnings).toHaveLength(1);
+  });
+
+  it('skips KIMI_MODEL_* overrides with an env warning instead of throwing', async () => {
+    const configPath = await writeTempConfig(VALID_TOML);
+    const result = loadRuntimeConfigSafe(configPath, {
+      KIMI_MODEL_NAME: 'env-model',
+    });
+    expect(result.fileWarnings).toEqual([]);
+    expect(result.envWarnings).toHaveLength(1);
+    expect(result.envWarnings[0]).toContain('KIMI_MODEL');
+    expect(result.config).toEqual(readConfigFile(configPath));
+  });
+
+  it('readConfigFileForUpdate rewraps validation errors with an actionable message', async () => {
+    const configPath = await writeTempConfig(`${VALID_TOML}
+[loop_control]
+max_steps_per_turn = "nope"
+`);
+    try {
+      readConfigFileForUpdate(configPath);
+      throw new Error('expected readConfigFileForUpdate to throw');
+    } catch (error) {
+      expect(error).toBeInstanceOf(KimiError);
+      expect((error as KimiError).message).toContain('fix it first');
+      expect((error as KimiError).message).toContain('kimi doctor');
+      expect((error as KimiError).message).not.toContain('invalid_type');
+    }
+
+    const goodPath = await writeTempConfig(VALID_TOML);
+    expect(readConfigFileForUpdate(goodPath)).toEqual(readConfigFile(goodPath));
+  });
+
+  it('drops invalid top-level scalars and keeps the rest', async () => {
+    const configPath = await writeTempConfig(`default_permission_mode = "not-a-mode"
+${VALID_TOML}`);
+    const result = loadRuntimeConfigSafe(configPath, {});
+    expect(result.config.defaultPermissionMode).toBeUndefined();
+    expect(result.config.providers['kimi']).toBeDefined();
+    expect(result.fileWarnings).toHaveLength(1);
+    expect(result.fileWarnings[0]).toContain('default_permission_mode');
+  });
+});
+
+describe('model overrides TOML', () => {
+  it('parses nested model overrides from snake_case TOML', () => {
+    const config = parseConfigString(`
+[models."kimi-code/kimi-k2"]
+provider = "managed:kimi-code"
+model = "kimi-k2"
+max_context_size = 262144
+support_efforts = ["low", "high", "max"]
+
+[models."kimi-code/kimi-k2".overrides]
+support_efforts = ["low", "high"]
+default_effort = "high"
+`);
+
+    expect(config.models?.['kimi-code/kimi-k2']?.overrides).toEqual({
+      supportEfforts: ['low', 'high'],
+      defaultEffort: 'high',
+    });
+  });
+
+  it('writes nested model overrides back as snake_case TOML data', () => {
+    const config = parseConfigString(`
+[models."kimi-code/kimi-k2"]
+provider = "managed:kimi-code"
+model = "kimi-k2"
+max_context_size = 262144
+
+[models."kimi-code/kimi-k2".overrides]
+support_efforts = ["low", "high"]
+`);
+
+    const data = configToTomlData(config);
+    const models = data['models'] as Record<string, Record<string, unknown>>;
+    const overrides = models['kimi-code/kimi-k2']?.['overrides'] as Record<string, unknown>;
+
+    expect(overrides['support_efforts']).toEqual(['low', 'high']);
+  });
+});
+
+describe('applyPrintModeConfigDefaults', () => {
+  it('fills unbounded print defaults when nothing is configured', () => {
+    const config = applyPrintModeConfigDefaults({ providers: {} });
+    expect(config.loopControl?.maxStepsPerTurn).toBe(0);
+    expect(config.background?.bashTaskTimeoutS).toBe(0);
+    expect(config.subagent?.timeoutMs).toBe(0);
+  });
+
+  it('lets explicit user config win over every print default', () => {
+    const config = applyPrintModeConfigDefaults({
+      providers: {},
+      loopControl: { maxStepsPerTurn: 7 },
+      background: { bashTaskTimeoutS: 30, keepAliveOnExit: true },
+      subagent: { timeoutMs: 5000 },
+    });
+    expect(config.loopControl?.maxStepsPerTurn).toBe(7);
+    expect(config.background?.bashTaskTimeoutS).toBe(30);
+    expect(config.background?.keepAliveOnExit).toBe(true);
+    expect(config.subagent?.timeoutMs).toBe(5000);
   });
 });

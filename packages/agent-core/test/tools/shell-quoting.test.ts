@@ -1,10 +1,10 @@
 import { Readable, type Writable } from 'node:stream';
 
-import type { KaosProcess } from '@moonshot-ai/kaos';
+import type { Environment, KaosProcess } from '@moonshot-ai/kaos';
 import { describe, expect, it, vi } from 'vitest';
 
 import { BashInputSchema, BashTool } from '../../src/tools/builtin/shell/bash';
-import type { Environment } from '../../src/utils/environment';
+import { createBackgroundManager } from '../agent/background/helpers';
 import { executeTool } from './fixtures/execute-tool';
 import { createFakeKaos } from './fixtures/fake-kaos';
 
@@ -33,6 +33,20 @@ function fakeProcess(): KaosProcess {
     exitCode: 0,
     wait: vi.fn(async () => 0),
     kill: vi.fn(async () => {}),
+    dispose: vi.fn(async () => {}),
+  };
+}
+
+function fakeProcessWithOutput(stdout: Readable, stderr: Readable): KaosProcess {
+  return {
+    stdin: { end: vi.fn(), write: vi.fn() } as unknown as Writable,
+    stdout,
+    stderr,
+    pid: 321,
+    exitCode: 0,
+    wait: vi.fn(async () => 0),
+    kill: vi.fn(async () => {}),
+    dispose: vi.fn(async () => {}),
   };
 }
 
@@ -44,7 +58,11 @@ function captureCommandRewrite(
 ): Promise<{ rewritten: string; argv: readonly string[] }> {
   const execWithEnv = vi.fn().mockResolvedValue(fakeProcess());
   const cwd = env.osKind === 'Windows' ? 'C:\\work' : '/work';
-  const tool = new BashTool(createFakeKaos({ execWithEnv }), cwd, env);
+  const tool = new BashTool(
+    createFakeKaos({ execWithEnv, osEnv: env }),
+    cwd,
+    createBackgroundManager().manager,
+  );
 
   return executeTool(tool, {
     turnId: '0',
@@ -131,5 +149,36 @@ describe('shell command nul-redirect — non-Windows passthrough', () => {
   ])('does not rewrite %s on Linux', async (command) => {
     const { rewritten } = await captureCommandRewrite(linuxEnv, command);
     expect(rewritten).toBe(command);
+  });
+});
+
+describe('BashTool streaming output updates', () => {
+  it('emits stdout and stderr chunks while preserving the final output', async () => {
+    const proc = fakeProcessWithOutput(
+      Readable.from([Buffer.from('out-1\n'), Buffer.from('out-2')]),
+      Readable.from([Buffer.from('err-1\n')]),
+    );
+    const execWithEnv = vi.fn().mockResolvedValue(proc);
+    const onUpdate = vi.fn();
+    const tool = new BashTool(
+      createFakeKaos({ execWithEnv, osEnv: linuxEnv }),
+      '/work',
+      createBackgroundManager().manager,
+    );
+
+    const result = await executeTool(tool, {
+      turnId: '0',
+      toolCallId: 'tc_stream',
+      args: { command: 'printf output' },
+      signal,
+      onUpdate,
+    });
+
+    expect(result.output).toContain('out-1\n');
+    expect(result.output).toContain('out-2');
+    expect(result.output).toContain('err-1\n');
+    expect(onUpdate).toHaveBeenCalledWith({ kind: 'stdout', text: 'out-1\n' });
+    expect(onUpdate).toHaveBeenCalledWith({ kind: 'stdout', text: 'out-2' });
+    expect(onUpdate).toHaveBeenCalledWith({ kind: 'stderr', text: 'err-1\n' });
   });
 });

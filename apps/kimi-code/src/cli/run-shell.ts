@@ -1,27 +1,35 @@
-import { execSync } from 'node:child_process';
+import { execSync, spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import { createKimiDeviceId, KIMI_CODE_PROVIDER_NAME } from '@moonshot-ai/kimi-code-oauth';
 import {
-  initializeTelemetry,
+  createKimiHarness,
+  flushDiagnosticLogsSync,
+  log,
+  type KimiHarness,
+  type TelemetryClient,
+} from '@moonshot-ai/kimi-code-sdk';
+import {
   setCrashPhase,
   setTelemetryContext,
   shutdownTelemetry,
   track,
   withTelemetryContext,
 } from '@moonshot-ai/kimi-telemetry';
-import { KimiHarness, log, type TelemetryClient } from '@moonshot-ai/kimi-code-sdk';
 
-import { CLI_SHUTDOWN_TIMEOUT_MS, CLI_UI_MODE, CLI_USER_AGENT_PRODUCT } from '#/constant/app';
+import { CLI_SHUTDOWN_TIMEOUT_MS, CLI_UI_MODE } from '#/constant/app';
 import { detectPendingMigration } from '#/migration/index';
 import type { TuiConfig } from '#/tui/config';
 import { loadTuiConfig, TuiConfigParseError } from '#/tui/config';
 import { CHROME_GUTTER } from '#/tui/constant/rendering';
 import { KimiTUI } from '#/tui/index';
-import { detectTerminalTheme } from '#/tui/theme/detect';
+import { currentTheme, getColorPalette } from '#/tui/theme';
+import { combineStartupNotice } from '#/tui/utils/startup';
+import { toTerminalHyperlink } from '#/utils/terminal-hyperlink';
+import { restoreTerminalModes } from '#/utils/terminal-restore';
 
 import type { CLIOptions } from './options';
+import { createCliTelemetryBootstrap, initializeCliTelemetry } from './telemetry';
 import { createKimiCodeHostIdentity } from './version';
 
 export async function runShell(
@@ -41,29 +49,33 @@ export async function runShell(
     configWarning = error.message;
   }
 
-  // Resolve `theme = "auto"` against the live terminal once, before pi-tui
-  // grabs stdin. Explicit `dark` / `light` skip detection.
-  const resolvedTheme = tuiConfig.theme === 'auto' ? await detectTerminalTheme() : tuiConfig.theme;
+  // Initialise the global Theme singleton before pi-tui grabs stdin.
+  const palette = await getColorPalette(tuiConfig.theme);
+  currentTheme.setPalette(palette);
 
   const workDir = process.cwd();
+  const telemetryBootstrap = createCliTelemetryBootstrap();
   const telemetryClient: TelemetryClient = {
     track,
     withContext: withTelemetryContext,
     setContext: setTelemetryContext,
   };
-  const harness = new KimiHarness({
+  const harness = createKimiHarness({
+    homeDir: telemetryBootstrap.homeDir,
     identity: createKimiCodeHostIdentity(version),
+    skillDirs: opts.skillsDirs,
     telemetry: telemetryClient,
     onOAuthRefresh: (outcome) => {
       if (outcome.success) {
-        track('oauth_refresh', { success: true });
+        track('oauth_refresh', { outcome: 'success' });
         return;
       }
       track('oauth_refresh', {
-        success: false,
+        outcome: 'error',
         reason: outcome.reason,
       });
     },
+    sessionStartedProperties: { yolo: opts.yolo, auto: opts.auto, plan: opts.plan, afk: false },
   });
   log.info('kimi-code starting', {
     version,
@@ -72,6 +84,7 @@ export async function runShell(
     platform: `${process.platform}/${process.arch}`,
     workDir,
   });
+
   await harness.ensureConfigFile();
   const migrationPlan = await detectPendingMigration({
     sourceHome: join(homedir(), '.kimi'),
@@ -84,41 +97,30 @@ export async function runShell(
     return;
   }
   const config = await harness.getConfig();
+  for (const warning of (await harness.getConfigDiagnostics()).warnings) {
+    configWarning = combineStartupNotice(configWarning, warning);
+  }
   const configMs = Date.now() - configStartedAt;
   const tui = new KimiTUI(harness, {
     cliOptions: opts,
+    additionalDirs: opts.addDirs?.length ? opts.addDirs : undefined,
     tuiConfig,
     version,
     workDir,
     startupNotice: configWarning,
-    resolvedTheme,
     migrationPlan,
     migrateOnly: runOptions.migrateOnly,
   });
 
-  let firstLaunch = false;
-  const deviceId = createKimiDeviceId(harness.homeDir, {
-    onFirstLaunch: () => {
-      firstLaunch = true;
-    },
-  });
-  initializeTelemetry({
-    homeDir: harness.homeDir,
-    deviceId,
-    enabled: config.telemetry !== false,
-    appName: CLI_USER_AGENT_PRODUCT,
+  initializeCliTelemetry({
+    harness,
+    bootstrap: telemetryBootstrap,
+    config,
     version,
     uiMode: CLI_UI_MODE,
-    model: config.defaultModel,
-    getAccessToken: async () =>
-      (await harness.auth.getCachedAccessToken(KIMI_CODE_PROVIDER_NAME)) ?? null,
   });
   setCrashPhase('runtime');
 
-  if (firstLaunch) {
-    harness.track('first_launch');
-  }
-  const resumed = opts.continue || opts.session !== undefined;
   const trackLifecycleForSession = (
     sessionId: string,
     event: string,
@@ -134,34 +136,93 @@ export async function runShell(
     trackLifecycleForSession(tui.getCurrentSessionId(), event, properties);
   };
 
+  let savedStty: string | undefined;
+  try {
+    // stty operates on the terminal behind stdin, so stdin must be the TTY —
+    // piping /dev/null (ignore) makes stty fail with "not a tty".
+    const saved = execSync('stty -g', {
+      encoding: 'utf8',
+      stdio: ['inherit', 'pipe', 'ignore'],
+    });
+    savedStty = typeof saved === 'string' ? saved.trim() : undefined;
+    execSync('stty -ixon', { stdio: ['inherit', 'ignore', 'ignore'] });
+  } catch {
+    /* ignore */
+  }
+  const restoreStty = (): void => {
+    if (savedStty === undefined) return;
+    const args = savedStty.split(/\s+/).filter((arg) => arg.length > 0);
+    if (args.length === 0) return;
+    spawnSync('stty', args, { stdio: ['inherit', 'ignore', 'ignore'] });
+  };
+
+  // If we crash without going through KimiTUI.stop(), the terminal is left in
+  // raw mode with a hidden cursor and XON/XOFF flow control disabled. Restore
+  // both before exiting so the user's shell is usable afterwards.
+  const emergencyExit = (exitCode: number): void => {
+    // The crash log above is only enqueued into the async sink; flush it
+    // synchronously or the `process.exit()` below would drop the one line that
+    // explains why we crashed. Best-effort: an exit path must never throw.
+    try {
+      flushDiagnosticLogsSync();
+    } catch {
+      /* ignore */
+    }
+    restoreTerminalModes();
+    restoreStty();
+    process.exit(exitCode);
+  };
+  const onUncaughtException = (error: unknown): void => {
+    try {
+      log.error('uncaughtException, restoring terminal and exiting', { error: String(error) });
+    } catch {
+      /* ignore */
+    }
+    emergencyExit(1);
+  };
+  const onUnhandledRejection = (reason: unknown): void => {
+    try {
+      log.error('unhandledRejection, restoring terminal and exiting', { reason: String(reason) });
+    } catch {
+      /* ignore */
+    }
+    emergencyExit(1);
+  };
+  process.on('uncaughtException', onUncaughtException);
+  process.on('unhandledRejection', onUnhandledRejection);
+  // Remove the crash handlers once the TUI exits cleanly so repeated runShell()
+  // calls in the same process (e.g. tests) don't accumulate process listeners.
+  const removeCrashHandlers = (): void => {
+    process.off('uncaughtException', onUncaughtException);
+    process.off('unhandledRejection', onUnhandledRejection);
+  };
+
   tui.onExit = async (exitCode = 0) => {
     const sessionId = tui.getCurrentSessionId();
     const hasContent = tui.hasSessionContent();
     setCrashPhase('shutdown');
-    trackLifecycle('exit', { duration_s: (Date.now() - startedAt) / 1000 });
+    trackLifecycle('exit', { duration_ms: Date.now() - startedAt });
     await shutdownTelemetry({ timeoutMs: CLI_SHUTDOWN_TIMEOUT_MS });
     const gutter = ' '.repeat(CHROME_GUTTER);
     process.stdout.write(`${gutter}Bye!\n`);
+    const hints: string[] = [];
     if (sessionId !== '' && hasContent) {
-      process.stderr.write(`\n${gutter}To resume this session: kimi -r ${sessionId}\n`);
+      hints.push(`${gutter}To resume this session: kimi -r ${sessionId}`);
     }
+    if (tui.exitOpenUrl !== undefined) {
+      hints.push(`${gutter}open ${toTerminalHyperlink(tui.exitOpenUrl, tui.exitOpenUrl)}`);
+    }
+    if (hints.length > 0) {
+      process.stderr.write(`\n${hints.join('\n')}\n`);
+    }
+    removeCrashHandlers();
+    restoreStty();
     process.exit(exitCode);
   };
-  try {
-    execSync('stty -ixon', { stdio: 'ignore' });
-  } catch {
-    /* ignore */
-  }
   try {
     const initStartedAt = Date.now();
     await tui.start();
     const initMs = Date.now() - initStartedAt;
-    trackLifecycle('started', {
-      resumed,
-      yolo: opts.yolo,
-      plan: opts.plan,
-      afk: false,
-    });
     const startupSessionId = tui.getCurrentSessionId();
     const mcpMs = await tui.getStartupMcpMs();
     trackLifecycleForSession(startupSessionId, 'startup_perf', {
@@ -171,8 +232,9 @@ export async function runShell(
       mcp_ms: mcpMs,
     });
   } catch (error) {
+    removeCrashHandlers();
     setCrashPhase('shutdown');
-    trackLifecycle('exit', { duration_s: (Date.now() - startedAt) / 1000 });
+    trackLifecycle('exit', { duration_ms: Date.now() - startedAt });
     await shutdownTelemetry({ timeoutMs: CLI_SHUTDOWN_TIMEOUT_MS });
     await harness.close();
     throw error;

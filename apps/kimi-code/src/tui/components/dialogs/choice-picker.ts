@@ -15,31 +15,45 @@ import {
   truncateToWidth,
   visibleWidth,
   type Focusable,
-} from '@earendil-works/pi-tui';
-import chalk from 'chalk';
-
-import type { ColorPalette } from '#/tui/theme/colors';
+} from '@moonshot-ai/pi-tui';
+import { CURRENT_MARK, SELECT_POINTER } from '#/tui/constant/symbols';
+import { currentTheme, type ColorToken } from '#/tui/theme';
+import { printableChar } from '#/tui/utils/printable-key';
+import { SearchableList } from '#/tui/utils/searchable-list';
 
 export interface ChoiceOption {
   /** Value passed to onSelect (e.g. the actual editor command string). */
   readonly value: string;
   /** Display text shown in the list. */
   readonly label: string;
+  /** Optional semantic tone for labels that need stronger visual treatment. */
+  readonly tone?: 'danger';
   /** Optional explanatory text shown below the label. */
   readonly description?: string | undefined;
+  /** Color token applied to the description while this option is selected, drawing
+   *  attention to important details. Falls back to `textMuted` when unset or not selected. */
+  readonly descriptionTone?: ColorToken;
 }
 
 export interface ChoicePickerOptions {
   readonly title: string;
   readonly hint?: string;
+  readonly formatHint?: (text: string) => string;
+  readonly notice?: string;
+  /** Color tone for the notice line. Defaults to 'success'. */
+  readonly noticeTone?: 'success' | 'warning';
   readonly options: readonly ChoiceOption[];
   readonly currentValue?: string;
-  readonly colors: ColorPalette;
+  /** When true, typed characters filter the list (fuzzy) and a search line is shown. */
+  readonly searchable?: boolean;
+  /** Items per page. Lists longer than this paginate. */
+  readonly pageSize?: number;
   readonly onSelect: (value: string) => void;
+  /** When provided, Alt+S invokes this with the selected value instead of
+   * onSelect — used to apply the choice to the current session only. */
+  readonly onSessionOnlySelect?: (value: string) => void;
   readonly onCancel: () => void;
 }
-
-const CURRENT_MARK = '← current';
 
 function wrapDescription(text: string, width: number): string[] {
   const maxWidth = Math.max(1, width);
@@ -67,67 +81,141 @@ function wrapDescription(text: string, width: number): string[] {
 export class ChoicePickerComponent extends Container implements Focusable {
   focused = false;
   private readonly opts: ChoicePickerOptions;
-  private selectedIndex: number;
+  private readonly list: SearchableList<ChoiceOption>;
 
   constructor(opts: ChoicePickerOptions) {
     super();
     this.opts = opts;
     const currentIdx = opts.options.findIndex((o) => o.value === opts.currentValue);
-    this.selectedIndex = Math.max(currentIdx, 0);
+    this.list = new SearchableList({
+      items: opts.options,
+      toSearchText: (o) => `${o.label} ${o.description ?? ''}`,
+      pageSize: opts.pageSize,
+      initialIndex: Math.max(currentIdx, 0),
+      searchable: opts.searchable === true,
+    });
   }
 
   handleInput(data: string): void {
     if (matchesKey(data, Key.escape)) {
+      if (this.list.clearQuery()) return;
       this.opts.onCancel();
       return;
     }
-    if (matchesKey(data, Key.up)) {
-      this.selectedIndex = Math.max(0, this.selectedIndex - 1);
+    if (matchesKey(data, Key.alt('s')) && this.opts.onSessionOnlySelect !== undefined) {
+      const chosen = this.list.selected();
+      if (chosen !== undefined) this.opts.onSessionOnlySelect(chosen.value);
       return;
     }
-    if (matchesKey(data, Key.down)) {
-      this.selectedIndex = Math.min(this.opts.options.length - 1, this.selectedIndex + 1);
+    // Left/Right page through the list (this picker has no horizontal control).
+    if (matchesKey(data, Key.left)) {
+      this.list.pageUp();
       return;
     }
-    if (matchesKey(data, Key.enter)) {
-      const chosen = this.opts.options[this.selectedIndex];
+    if (matchesKey(data, Key.right)) {
+      this.list.pageDown();
+      return;
+    }
+    // Enter always selects. Space selects too — but only when the list is not
+    // searchable; in a searchable list a space must reach the query instead.
+    const isSpace = matchesKey(data, Key.space) || printableChar(data) === ' ';
+    if (matchesKey(data, Key.enter) || (isSpace && this.opts.searchable !== true)) {
+      const chosen = this.list.selected();
       if (chosen !== undefined) this.opts.onSelect(chosen.value);
       return;
     }
+    this.list.handleKey(data);
   }
 
   override render(width: number): string[] {
-    const { colors } = this.opts;
-    const hint = this.opts.hint ?? '↑↓ navigate · Enter select · Esc cancel';
-    const lines: string[] = [
-      chalk.hex(colors.primary)('─'.repeat(width)),
-      chalk.hex(colors.primary).bold(` ${this.opts.title}`),
-      chalk.hex(colors.textMuted)(` ${hint}`),
-      '',
-    ];
+    const searchable = this.opts.searchable === true;
+    const view = this.list.view();
+    const options = view.items;
 
-    for (let i = 0; i < this.opts.options.length; i++) {
-      const opt = this.opts.options[i]!;
-      const isSelected = i === this.selectedIndex;
+    // Header mirrors the model dialog (see model-selector.ts): border, title
+    // with a "(type to search)" suffix until you type, the hint, a blank, then
+    // the search line. Key vocabulary is lowercase to match every list dialog.
+    const navParts = ['↑↓ navigate'];
+    if (view.page.pageCount > 1) navParts.push('←→ page');
+    navParts.push('Enter select', 'Esc cancel');
+    const hint = this.opts.hint ?? navParts.join(' · ');
+
+    const titleSuffix =
+      searchable && view.query.length === 0 ? currentTheme.fg('textMuted', '  (type to search)') : '';
+    const hintLines = hint.split(/\r?\n/);
+    const lines: string[] = [
+      currentTheme.fg('primary', '─'.repeat(width)),
+      currentTheme.boldFg('primary', ` ${this.opts.title}`) + titleSuffix,
+    ];
+    for (const hintLine of hintLines) {
+      lines.push(
+        this.opts.formatHint === undefined
+          ? currentTheme.fg('textMuted', ` ${hintLine}`)
+          : this.opts.formatHint(` ${hintLine}`),
+      );
+    }
+    if (this.opts.notice !== undefined) {
+      const tone = this.opts.noticeTone ?? 'success';
+      const noticeWidth = Math.max(1, width - 1);
+      for (const noticeLine of this.opts.notice.split(/\r?\n/)) {
+        for (const wrapped of wrapDescription(noticeLine, noticeWidth)) {
+          lines.push(currentTheme.fg(tone, ` ${wrapped}`));
+        }
+      }
+    }
+    lines.push('');
+    if (searchable && view.query.length > 0) {
+      lines.push(currentTheme.fg('primary', ` Search: `) + currentTheme.fg('text', view.query));
+    }
+
+    if (options.length === 0) {
+      lines.push(currentTheme.fg('textMuted', '   No matches'));
+    }
+    for (let i = view.page.start; i < view.page.end; i++) {
+      const opt = options[i]!;
+      const isSelected = i === view.selectedIndex;
       const isCurrent = opt.value === this.opts.currentValue;
-      const pointer = isSelected ? '❯' : ' ';
-      const labelStyle = isSelected ? chalk.hex(colors.primary).bold : chalk.hex(colors.text);
-      let line = chalk.hex(isSelected ? colors.primary : colors.textDim)(`  ${pointer} `);
+      const pointer = isSelected ? SELECT_POINTER : ' ';
+      const labelStyle = optionLabelStyle(opt, isSelected);
+      let line = currentTheme.fg(isSelected ? 'primary' : 'textDim', `  ${pointer} `);
       line += labelStyle(opt.label);
       if (isCurrent) {
-        line += ' ' + chalk.hex(colors.success)(CURRENT_MARK);
+        line += ' ' + currentTheme.fg('success', CURRENT_MARK);
       }
       lines.push(line);
       if (opt.description !== undefined && opt.description.length > 0) {
         const descriptionWidth = Math.max(1, width - 4);
+        const descriptionColor =
+          isSelected && opt.descriptionTone !== undefined ? opt.descriptionTone : 'textMuted';
         for (const descLine of wrapDescription(opt.description, descriptionWidth)) {
-          lines.push(chalk.hex(colors.textMuted)(`    ${descLine}`));
+          lines.push(currentTheme.fg(descriptionColor, `    ${descLine}`));
         }
       }
     }
 
     lines.push('');
-    lines.push(chalk.hex(colors.primary)('─'.repeat(width)));
+    if (view.page.pageCount > 1) {
+      lines.push(
+        currentTheme.fg('textMuted',
+          ` Page ${String(view.page.page + 1)}/${String(view.page.pageCount)}`,
+        ),
+      );
+    }
+    lines.push(currentTheme.fg('primary', '─'.repeat(width)));
     return lines.map((line) => truncateToWidth(line, width));
   }
+}
+
+function optionLabelStyle(
+  option: ChoiceOption,
+  selected: boolean,
+): (text: string) => string {
+  if (option.tone === 'danger') {
+    return selected
+      ? (text) => currentTheme.boldFg('error', text)
+      : (text) => currentTheme.fg('error', text);
+  }
+  return selected
+    ? (text) => currentTheme.boldFg('primary', text)
+    : (text) => currentTheme.fg('text', text);
 }

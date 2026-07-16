@@ -21,9 +21,36 @@ describe('Event public types', () => {
     expectTypeOf<EventByType<'tool.call.started'>['args']>().toEqualTypeOf<unknown>();
   });
 
+  it('exposes LLM stream timing on step completion events', () => {
+    expectTypeOf<EventByType<'turn.step.completed'>['llmFirstTokenLatencyMs']>().toEqualTypeOf<
+      number | undefined
+    >();
+    expectTypeOf<EventByType<'turn.step.completed'>['llmStreamDurationMs']>().toEqualTypeOf<
+      number | undefined
+    >();
+    expectTypeOf<EventByType<'turn.step.completed'>['llmRequestBuildMs']>().toEqualTypeOf<
+      number | undefined
+    >();
+    expectTypeOf<EventByType<'turn.step.completed'>['llmServerFirstTokenMs']>().toEqualTypeOf<
+      number | undefined
+    >();
+    expectTypeOf<EventByType<'turn.step.completed'>['llmServerDecodeMs']>().toEqualTypeOf<
+      number | undefined
+    >();
+    expectTypeOf<EventByType<'turn.step.completed'>['llmClientConsumeMs']>().toEqualTypeOf<
+      number | undefined
+    >();
+  });
+
   it('narrows subagent lifecycle events by type', () => {
     expectTypeOf<EventByType<'subagent.spawned'>['subagentId']>().toEqualTypeOf<string>();
     expectTypeOf<EventByType<'subagent.spawned'>['runInBackground']>().toEqualTypeOf<boolean>();
+    expectTypeOf<EventByType<'subagent.suspended'>['reason']>().toEqualTypeOf<string>();
+  });
+
+  it('narrows cron fired events by type', () => {
+    expectTypeOf<EventByType<'cron.fired'>['prompt']>().toEqualTypeOf<string>();
+    expectTypeOf<EventByType<'cron.fired'>['origin']['kind']>().toEqualTypeOf<'cron_job'>();
   });
 
   it('exposes approval and question reverse-RPC requests', () => {
@@ -41,8 +68,19 @@ describe('Event public types', () => {
       switch (event.type) {
         case 'agent.status.updated':
         case 'session.meta.updated':
+        case 'event.session.created':
+        case 'event.session.status_changed':
+        case 'event.session.work_changed':
+        case 'event.workspace.created':
+        case 'event.workspace.updated':
+        case 'event.workspace.deleted':
+        case 'event.config.changed':
+        case 'event.model_catalog.changed':
+        case 'goal.updated':
         case 'skill.activated':
+        case 'plugin_command.activated':
         case 'error':
+        case 'warning':
         case 'turn.started':
         case 'turn.ended':
         case 'turn.step.started':
@@ -55,19 +93,29 @@ describe('Event public types', () => {
         case 'tool.call.delta':
         case 'tool.call.started':
         case 'tool.progress':
+        case 'shell.output':
+        case 'shell.started':
         case 'tool.result':
         case 'tool.list.updated':
         case 'mcp.server.status':
         case 'subagent.spawned':
+        case 'subagent.started':
+        case 'subagent.suspended':
         case 'subagent.completed':
         case 'subagent.failed':
         case 'compaction.started':
         case 'compaction.blocked':
         case 'compaction.cancelled':
         case 'compaction.completed':
+        case 'task.started':
+        case 'task.terminated':
         case 'background.task.started':
-        case 'background.task.updated':
         case 'background.task.terminated':
+        case 'cron.fired':
+        case 'prompt.submitted':
+        case 'prompt.completed':
+        case 'prompt.aborted':
+        case 'prompt.steered':
           return;
         default:
           assertNever(event);

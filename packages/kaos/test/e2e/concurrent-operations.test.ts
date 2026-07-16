@@ -1,6 +1,6 @@
 import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join } from 'pathe';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
@@ -14,7 +14,7 @@ describe('e2e: concurrent operations', () => {
   let originalCwd: string;
 
   beforeEach(async () => {
-    kaos = new LocalKaos();
+    kaos = await LocalKaos.create();
     originalCwd = process.cwd();
     tempDir = await realpath(await mkdtemp(join(tmpdir(), 'kaos-concurrent-')));
     process.chdir(tempDir);

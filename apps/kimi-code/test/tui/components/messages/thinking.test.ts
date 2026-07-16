@@ -1,9 +1,8 @@
-import type { TUI } from '@earendil-works/pi-tui';
+import { visibleWidth, type TUI } from '@moonshot-ai/pi-tui';
 import { describe, expect, it, vi } from 'vitest';
 
 import { ThinkingComponent } from '#/tui/components/messages/thinking';
 import { STATUS_BULLET } from '#/tui/constant/symbols';
-import { darkColors } from '#/tui/theme/colors';
 
 function strip(text: string): string {
   return text.replaceAll(/\u001B\[[0-9;]*m/g, '');
@@ -13,7 +12,7 @@ const longThinking = ['line1', 'line2', 'line3', 'line4', 'line5', 'line6', 'lin
 
 describe('ThinkingComponent', () => {
   it('shows the live spinner header before thinking content', () => {
-    const component = new ThinkingComponent('working it out', darkColors, true, 'live');
+    const component = new ThinkingComponent('working it out', true, 'live');
     const out = strip(component.render(80).join('\n'));
 
     expect(out).toContain('⠋ thinking...');
@@ -23,12 +22,13 @@ describe('ThinkingComponent', () => {
   });
 
   it('keeps live thinking height-limited to the tail', () => {
-    const component = new ThinkingComponent(longThinking, darkColors, true, 'live');
+    const component = new ThinkingComponent(longThinking, true, 'live');
     const out = strip(component.render(80).join('\n'));
 
     expect(out).not.toContain('line1');
     expect(out).not.toContain('line4');
-    expect(out).toContain('line5');
+    expect(out).not.toContain('line5');
+    expect(out).toContain('line6');
     expect(out).toContain('line7');
     expect(out).not.toContain('ctrl+o to expand');
   });
@@ -36,7 +36,7 @@ describe('ThinkingComponent', () => {
   it('animates the live spinner and stops on finalize', () => {
     vi.useFakeTimers();
     const requestRender = vi.fn();
-    const component = new ThinkingComponent('step', darkColors, true, 'live', {
+    const component = new ThinkingComponent('step', true, 'live', {
       requestRender,
     } as unknown as TUI);
 
@@ -54,19 +54,20 @@ describe('ThinkingComponent', () => {
   });
 
   it('finalizes in place into a collapsed preview', () => {
-    const component = new ThinkingComponent(longThinking, darkColors, true, 'live');
+    const component = new ThinkingComponent(longThinking, true, 'live');
 
     component.finalize();
 
     const out = strip(component.render(80).join('\n'));
     expect(out).toContain('line1');
-    expect(out).toContain('line3');
+    expect(out).toContain('line2');
+    expect(out).not.toContain('line3');
     expect(out).not.toContain('line4');
-    expect(out).toContain('... (4 more lines, ctrl+o to expand)');
+    expect(out).toContain('... (5 more lines, ctrl+o to expand)');
   });
 
   it('expands and collapses after finalization', () => {
-    const component = new ThinkingComponent(longThinking, darkColors, true, 'live');
+    const component = new ThinkingComponent(longThinking, true, 'live');
     component.finalize();
 
     component.setExpanded(true);
@@ -78,5 +79,14 @@ describe('ThinkingComponent', () => {
     const collapsed = strip(component.render(80).join('\n'));
     expect(collapsed).not.toContain('line7');
     expect(collapsed).toContain('ctrl+o to expand');
+  });
+
+  it('keeps the finalized truncation footer within the requested render width', () => {
+    const component = new ThinkingComponent(longThinking, true, 'live');
+    component.finalize();
+
+    for (const line of component.render(37)) {
+      expect(visibleWidth(line)).toBeLessThanOrEqual(37);
+    }
   });
 });

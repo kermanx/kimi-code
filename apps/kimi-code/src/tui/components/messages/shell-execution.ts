@@ -1,22 +1,27 @@
-import type { Component } from '@earendil-works/pi-tui';
-import { Container, Text } from '@earendil-works/pi-tui';
-import chalk from 'chalk';
+import type { Component } from '@moonshot-ai/pi-tui';
+import { Container, Text } from '@moonshot-ai/pi-tui';
 
-import { COMMAND_PREVIEW_LINES } from '#/tui/constant/rendering';
-import type { ColorPalette } from '#/tui/theme/colors';
+import { currentTheme } from '#/tui/theme';
 import type { ToolCallBlockData, ToolResultBlockData } from '#/tui/types';
 
 import type { ResultRenderer } from './tool-renderers/types';
 import { PREVIEW_LINES } from './tool-renderers/types';
+import { TruncatedOutputComponent } from './tool-renderers/truncated';
 
 export interface ShellExecutionOptions {
   readonly command?: string;
   readonly result?: ToolResultBlockData;
-  readonly colors: ColorPalette;
   readonly expanded?: boolean;
   readonly showCommand?: boolean;
+  /**
+   * Max command lines to render. `undefined` means no cap — used by the
+   * ctrl+o expanded view so the user can see the full multi-line command
+   * even when the header preview was truncated.
+   */
   readonly commandPreviewLines?: number;
   readonly resultPreviewLines?: number;
+  readonly tailOutput?: boolean;
+  readonly expandHint?: boolean;
 }
 
 export class ShellExecutionComponent extends Container {
@@ -24,65 +29,69 @@ export class ShellExecutionComponent extends Container {
     super();
 
     if (options.showCommand === true) {
-      this.addCommandPreview(
-        options.command ?? '',
-        options.commandPreviewLines ?? COMMAND_PREVIEW_LINES,
-      );
+      this.addCommandPreview(options.command ?? '', options.commandPreviewLines);
     }
 
     if (options.result !== undefined) {
       this.addResultPreview(
         options.result,
-        options.colors,
         options.expanded ?? false,
         options.resultPreviewLines ?? PREVIEW_LINES,
+        options.tailOutput ?? false,
+        options.expandHint ?? true,
       );
     }
   }
 
-  private addCommandPreview(command: string, previewLines: number): void {
+  private addCommandPreview(command: string, previewLines: number | undefined): void {
     if (command.length === 0) return;
-    const lines = command.split('\n').slice(0, previewLines);
+    const allLines = command.split('\n');
+    const lines = previewLines === undefined ? allLines : allLines.slice(0, previewLines);
     for (const [i, line] of lines.entries()) {
-      const prefix = i === 0 ? '$ ' : '  ';
-      this.addChild(new Text(chalk.dim(prefix + line), 2, 0));
+      // Distinguish the command (input) from the result (output): the `$`
+      // prompt uses the dedicated shell-mode hue, the command body uses
+      // `textDim`, and the result below is rendered one step dimmer in
+      // `textMuted` so the two stay separable without a connecting glyph.
+      const text =
+        i === 0
+          ? currentTheme.fg('shellMode', '$ ') + currentTheme.dim(line)
+          : `  ${currentTheme.dim(line)}`;
+      this.addChild(new Text(text, 2, 0));
     }
   }
 
   private addResultPreview(
     result: ToolResultBlockData,
-    colors: ColorPalette,
     expanded: boolean,
     previewLines: number,
+    tailOutput: boolean,
+    expandHint: boolean,
   ): void {
     if (!result.output) return;
-    const tint = result.is_error ? chalk.hex(colors.error) : chalk.dim;
-    if (expanded) {
-      this.addChild(new Text(tint(result.output), 2, 0));
-      return;
-    }
-
-    const lines = result.output.split('\n');
-    const shown = lines.slice(0, previewLines);
-    const remaining = lines.length - shown.length;
-    this.addChild(new Text(tint(shown.join('\n')), 2, 0));
-    if (remaining > 0) {
-      this.addChild(
-        new Text(chalk.dim(`... (${String(remaining)} more lines, ctrl+o to expand)`), 2, 0),
-      );
-    }
+    this.addChild(
+      new TruncatedOutputComponent(result.output, {
+        expanded,
+        isError: result.is_error ?? false,
+        maxLines: previewLines,
+        tail: tailOutput,
+        expandHint,
+        color: 'textMuted',
+      }),
+    );
   }
 }
 
 export const shellExecutionResultRenderer: ResultRenderer = (
-  toolCall: ToolCallBlockData,
+  _toolCall: ToolCallBlockData,
   result: ToolResultBlockData,
   ctx,
 ): Component[] => [
+  // Result only. The command preview is owned by ToolCallComponent's
+  // buildCallPreview across the whole lifecycle (streaming, running, and
+  // done); rendering it here too would duplicate the command once the result
+  // lands.
   new ShellExecutionComponent({
-    command: typeof toolCall.args['command'] === 'string' ? toolCall.args['command'] : '',
     result,
-    colors: ctx.colors,
     expanded: ctx.expanded,
   }),
 ];

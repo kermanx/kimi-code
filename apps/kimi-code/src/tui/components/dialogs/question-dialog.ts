@@ -14,15 +14,15 @@ import {
   type Focusable,
   truncateToWidth,
   visibleWidth,
-} from '@earendil-works/pi-tui';
-import chalk from 'chalk';
+  wrapTextWithAnsi,
+} from '@moonshot-ai/pi-tui';
 
+import { currentTheme } from '#/tui/theme';
 import type {
   PendingQuestion,
   QuestionPanelResponse,
   QuestionSubmissionMethod,
 } from '#/tui/reverse-rpc/types';
-import type { ColorPalette } from '#/tui/theme/colors';
 
 const NUMBER_KEYS = ['1', '2', '3', '4', '5', '6', '7', '8', '9'];
 const MAX_BODY_LINES = 12;
@@ -39,11 +39,40 @@ interface DisplayOption {
   readonly kind: 'preset' | 'other';
 }
 
+/**
+ * Push `content` to `lines`, wrapping it to fit `width` with a hanging
+ * indent. The first physical line starts with `firstPrefix`; continuation
+ * lines get `continuationPrefix`. Pass `tone` to wrap every emitted line
+ * in a single ANSI span (cleaner for selection highlights and matches the
+ * pre-wrap rendering tests expect); leave it undefined when the prefixes
+ * already carry their own mixed styling.
+ */
+function appendWrapped(
+  lines: string[],
+  firstPrefix: string,
+  continuationPrefix: string,
+  content: string,
+  width: number,
+  tone?: (s: string) => string,
+): void {
+  const prefixWidth = Math.max(visibleWidth(firstPrefix), visibleWidth(continuationPrefix));
+  const contentWidth = Math.max(1, width - prefixWidth);
+  const wrapped = wrapTextWithAnsi(content, contentWidth);
+  const styleLine = tone ?? ((s: string) => s);
+  if (wrapped.length === 0) {
+    lines.push(styleLine(firstPrefix));
+    return;
+  }
+  lines.push(styleLine(`${firstPrefix}${wrapped[0] ?? ''}`));
+  for (let i = 1; i < wrapped.length; i++) {
+    lines.push(styleLine(`${continuationPrefix}${wrapped[i] ?? ''}`));
+  }
+}
+
 export class QuestionDialogComponent extends Container implements Focusable {
   focused = false;
 
   private readonly request: PendingQuestion;
-  private readonly colors: ColorPalette;
   private readonly onAnswer: (response: QuestionPanelResponse) => void;
   private readonly maxVisibleOptions: number;
   private readonly otherInput = new Input();
@@ -68,23 +97,18 @@ export class QuestionDialogComponent extends Container implements Focusable {
   private readonly answers: (string | undefined)[];
 
   private readonly onToggleToolOutput: (() => void) | undefined;
-  private readonly onTogglePlanExpand: (() => void) | undefined;
 
   constructor(
     request: PendingQuestion,
     onAnswer: (response: QuestionPanelResponse) => void,
-    colors: ColorPalette,
     maxVisibleOptions = 6,
     onToggleToolOutput?: () => void,
-    onTogglePlanExpand?: () => void,
   ) {
     super();
     this.request = request;
     this.onAnswer = onAnswer;
-    this.colors = colors;
     this.maxVisibleOptions = maxVisibleOptions;
     this.onToggleToolOutput = onToggleToolOutput;
-    this.onTogglePlanExpand = onTogglePlanExpand;
     this.otherInput.onSubmit = (value) => {
       this.commitOtherInput(value, 'enter');
     };
@@ -113,11 +137,6 @@ export class QuestionDialogComponent extends Container implements Focusable {
 
     if (matchesKey(data, Key.ctrl('o'))) {
       this.onToggleToolOutput?.();
-      return;
-    }
-
-    if (matchesKey(data, Key.ctrl('e'))) {
-      this.onTogglePlanExpand?.();
       return;
     }
 
@@ -422,17 +441,16 @@ export class QuestionDialogComponent extends Container implements Focusable {
     const question = this.request.data.questions[questionIdx];
     if (question === undefined) return [];
 
-    const colors = this.colors;
-    const accent = chalk.hex(colors.primary);
-    const dim = chalk.hex(colors.textDim);
-    const success = chalk.hex(colors.success);
+    const accent = (text: string) => currentTheme.fg('primary', text);
+    const dim = (text: string) => currentTheme.fg('textDim', text);
+    const success = (text: string) => currentTheme.fg('success', text);
 
     const renderWidth = Math.max(1, width);
-    const lines: string[] = [accent('─'.repeat(renderWidth)), accent.bold(' question'), ''];
+    const lines: string[] = [accent('─'.repeat(renderWidth)), currentTheme.boldFg('primary', ' question'), ''];
     this.pushTabs(lines);
     lines.push('');
 
-    lines.push(accent(` ? ${question.question}`));
+    appendWrapped(lines, ' ? ', '   ', question.question, renderWidth, accent);
     if (this.isEditingOther()) {
       lines.push(dim('   Type your answer, then press Enter to save.'));
     }
@@ -442,7 +460,7 @@ export class QuestionDialogComponent extends Container implements Focusable {
       const bodyLines = question.body.trim().split('\n');
       const visibleBodyLines = bodyLines.slice(0, MAX_BODY_LINES);
       for (const bodyLine of visibleBodyLines) {
-        lines.push(dim(`   ${bodyLine}`));
+        appendWrapped(lines, '   ', '   ', bodyLine, renderWidth, dim);
       }
       if (bodyLines.length > visibleBodyLines.length) {
         lines.push(dim(`   ... ${String(bodyLines.length - visibleBodyLines.length)} more lines`));
@@ -473,31 +491,34 @@ export class QuestionDialogComponent extends Container implements Focusable {
 
       const label = this.renderOptionLabel(questionIdx, option, isCursor);
 
-      let line: string;
+      let tone: (s: string) => string;
+      let prefix: string;
       if (question.multi_select) {
         const checked = isSelected ? '✓' : ' ';
-        const body = `[${checked}] ${label}`;
-        if (isSelected && isCursor) line = success.bold(`  ${body}`);
-        else if (isSelected) line = success(`  ${body}`);
-        else if (isCursor) line = accent(`  ${body}`);
-        else line = dim(`  ${body}`);
+        prefix = `  [${checked}] `;
+        if (isSelected && isCursor) tone = (s) => currentTheme.boldFg('success', s);
+        else if (isSelected) tone = success;
+        else if (isCursor) tone = accent;
+        else tone = dim;
       } else if (isSelected && this.isAnswered(questionIdx)) {
-        line = isCursor
-          ? success.bold(`  → [${String(num)}] ${label}`)
-          : success(`    [${String(num)}] ${label}`);
+        prefix = isCursor ? `  → [${String(num)}] ` : `    [${String(num)}] `;
+        tone = isCursor ? (s) => currentTheme.boldFg('success', s) : success;
       } else if (isCursor) {
-        line = accent(`  → [${String(num)}] ${label}`);
+        prefix = `  → [${String(num)}] `;
+        tone = accent;
       } else {
-        line = dim(`    [${String(num)}] ${label}`);
+        prefix = `    [${String(num)}] `;
+        tone = dim;
       }
-      lines.push(line);
+      const continuation = ' '.repeat(visibleWidth(prefix));
+      appendWrapped(lines, prefix, continuation, label, renderWidth, tone);
 
       if (
         option.description !== undefined &&
         option.description.length > 0 &&
         !(this.isEditingOther() && isCursor && isOther)
       ) {
-        lines.push(dim(`        ${option.description}`));
+        appendWrapped(lines, '        ', '        ', option.description, renderWidth, dim);
       }
     }
 
@@ -517,17 +538,16 @@ export class QuestionDialogComponent extends Container implements Focusable {
   }
 
   private renderSubmitTab(width: number): string[] {
-    const colors = this.colors;
-    const accent = chalk.hex(colors.primary);
-    const dim = chalk.hex(colors.textDim);
-    const text = chalk.hex(colors.text);
-    const warning = chalk.hex(colors.warning);
+    const accent = (text: string) => currentTheme.fg('primary', text);
+    const dim = (text: string) => currentTheme.fg('textDim', text);
+    const text = (t: string) => currentTheme.fg('text', t);
+    const warning = (text: string) => currentTheme.fg('warning', text);
 
     const renderWidth = Math.max(1, width);
-    const lines: string[] = [accent('─'.repeat(renderWidth)), accent.bold(' question'), ''];
+    const lines: string[] = [accent('─'.repeat(renderWidth)), currentTheme.boldFg('primary', ' question'), ''];
     this.pushTabs(lines);
     lines.push('');
-    lines.push(text.bold(` ${REVIEW_TITLE}`));
+    lines.push(currentTheme.boldFg('text', ` ${REVIEW_TITLE}`));
     const reviewWarning =
       this.reviewMessage ?? (this.hasUnansweredQuestions() ? UNANSWERED_WARNING : undefined);
     if (reviewWarning !== undefined) {
@@ -539,9 +559,21 @@ export class QuestionDialogComponent extends Container implements Focusable {
       const question = this.request.data.questions[i];
       if (question === undefined) continue;
       const answer = this.answers[i];
-      lines.push(`  ${dim('Q')}  ${question.question}`);
+      appendWrapped(
+        lines,
+        `  ${dim('Q')}  `,
+        '       ',
+        question.question,
+        renderWidth,
+      );
       if (answer !== undefined && answer.length > 0) {
-        lines.push(`  ${accent('→')}  ${text(answer)}`);
+        appendWrapped(
+          lines,
+          `  ${accent('→')}  `,
+          '       ',
+          text(answer),
+          renderWidth,
+        );
       } else {
         lines.push(`  ${dim('→')}  ${dim(NOT_ANSWERED_LABEL)}`);
       }
@@ -570,8 +602,9 @@ export class QuestionDialogComponent extends Container implements Focusable {
   }
 
   private pushTabs(lines: string[]): void {
-    const dim = chalk.hex(this.colors.textDim);
-    const active = chalk.bgHex(this.colors.primary).hex(this.colors.text).bold;
+    const dim = (text: string) => currentTheme.fg('textDim', text);
+    const active = (text: string) =>
+      currentTheme.bg('primary', currentTheme.boldFg('text', text));
 
     const tabs: string[] = [];
     for (let i = 0; i < this.request.data.questions.length; i++) {
@@ -582,7 +615,7 @@ export class QuestionDialogComponent extends Container implements Focusable {
           ? question.header
           : `Q${String(i + 1)}`;
       if (i === this.currentTab) tabs.push(active(` ${label} `));
-      else if (this.isAnswered(i)) tabs.push(chalk.hex(this.colors.success)(`(✓) ${label}`));
+      else if (this.isAnswered(i)) tabs.push(currentTheme.fg('success', `(✓) ${label}`));
       else tabs.push(dim(`(○) ${label}`));
     }
 
@@ -599,7 +632,7 @@ export class QuestionDialogComponent extends Container implements Focusable {
         'type answer',
         '↵ save',
         ...(this.totalTabs() > 1 ? ['tab switch'] : []),
-        'esc dismiss',
+        'esc cancel',
       ];
       return dim(`  ${parts.join('  ')}`);
     }
@@ -607,21 +640,21 @@ export class QuestionDialogComponent extends Container implements Focusable {
     const optionCount = Math.min(this.displayOptions(questionIdx).length, NUMBER_KEYS.length);
     const numberHint = optionCount <= 1 ? '1' : `1-${String(optionCount)}`;
     const question = this.request.data.questions[questionIdx];
-    if (question === undefined) return dim('  esc dismiss');
+    if (question === undefined) return dim('  esc cancel');
 
     const parts: string[] = [
-      '▲/▼ select',
+      '↑↓ select',
       `${numberHint} / ↵ ${question.multi_select ? 'toggle' : 'choose'}`,
     ];
     if (this.totalTabs() > 1) parts.push('←/→/tab switch');
-    parts.push('esc dismiss');
+    parts.push('esc cancel');
     return dim(`  ${parts.join('  ')}`);
   }
 
   private buildSubmitHint(dim: (s: string) => string): string {
-    const parts: string[] = ['▲/▼ select', '1/2 choose', '↵ confirm'];
+    const parts: string[] = ['↑↓ select', '1/2 choose', '↵ confirm'];
     if (this.totalTabs() > 1) parts.push('←/→/tab switch');
-    parts.push('esc dismiss');
+    parts.push('esc cancel');
     return dim(`  ${parts.join('  ')}`);
   }
 
@@ -712,14 +745,14 @@ export class QuestionDialogComponent extends Container implements Focusable {
       const checked = isSelected ? '✓' : ' ';
       const body = `  [${checked}] ${option.label}: `;
       prefix = isSelected
-        ? chalk.hex(this.colors.success).bold(body)
-        : chalk.hex(this.colors.primary)(body);
+        ? currentTheme.boldFg('success', body)
+        : currentTheme.fg('primary', body);
     } else {
       const body = `  → [${String(num)}] ${option.label}: `;
       prefix =
         isSelected && this.isAnswered(questionIdx)
-          ? chalk.hex(this.colors.success).bold(body)
-          : chalk.hex(this.colors.primary)(body);
+          ? currentTheme.boldFg('success', body)
+          : currentTheme.fg('primary', body);
     }
 
     const inputWidth = Math.max(4, width - visibleWidth(prefix) + 2);

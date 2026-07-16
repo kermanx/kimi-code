@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -9,6 +9,8 @@ import {
   createKimiDeviceHeaders,
   createKimiDeviceId,
   createKimiUserAgent,
+  KIMI_CODE_PLATFORM,
+  readKimiDeviceId,
 } from '../src/identity';
 
 const tmpRoots: string[] = [];
@@ -42,13 +44,30 @@ describe('Kimi identity factories', () => {
     expect(second).not.toBe(first);
   });
 
+  it('reads an existing device id without creating one when missing', () => {
+    const homeDir = tempHome();
+
+    expect(readKimiDeviceId(homeDir)).toBeNull();
+    expect(readKimiDeviceId(homeDir)).toBeNull();
+
+    const first = createKimiDeviceId(homeDir);
+    expect(readKimiDeviceId(homeDir)).toBe(first);
+  });
+
+  it('treats an empty device id file as missing', () => {
+    const homeDir = tempHome();
+    writeFileSync(join(homeDir, 'device_id'), '  \n', 'utf-8');
+
+    expect(readKimiDeviceId(homeDir)).toBeNull();
+  });
+
   it('creates complete X-Msh device headers from host version', () => {
     const headers = createKimiDeviceHeaders({
       homeDir: tempHome(),
       version: '1.2.3-test',
     });
 
-    expect(headers['X-Msh-Platform']).toBe('kimi-code-cli');
+    expect(headers['X-Msh-Platform']).toBe(KIMI_CODE_PLATFORM);
     expect(headers['X-Msh-Version']).toBe('1.2.3-test');
     expect(headers['X-Msh-Device-Name']).toBeTruthy();
     expect(headers['X-Msh-Device-Model']).toBeTruthy();
@@ -144,6 +163,35 @@ describe('ascii header value sanitization', () => {
       }
     } finally {
       vi.doUnmock('node:os');
+      vi.resetModules();
+    }
+  });
+
+  it('falls back to Darwin kernel version when sw_vers is unavailable', async () => {
+    vi.resetModules();
+    vi.doMock('node:os', async () => ({
+      ...(await vi.importActual<typeof import('node:os')>('node:os')),
+      hostname: () => 'my-mac',
+      release: () => '25.5.0',
+      type: () => 'Darwin',
+      arch: () => 'arm64',
+    }));
+    // Force the sw_vers lookup to fail so the test is deterministic on macOS too,
+    // where the real binary would otherwise return the host's product version.
+    vi.doMock('node:child_process', async () => ({
+      ...(await vi.importActual<typeof import('node:child_process')>('node:child_process')),
+      execFileSync: () => {
+        throw new Error('ENOENT');
+      },
+    }));
+
+    try {
+      const { createKimiDeviceHeaders } = await import('../src/identity');
+      const headers = createKimiDeviceHeaders({ homeDir: tempHome(), version: '1.0.0' });
+      expect(headers['X-Msh-Device-Model']).toBe('macOS 25.5.0 arm64');
+    } finally {
+      vi.doUnmock('node:os');
+      vi.doUnmock('node:child_process');
       vi.resetModules();
     }
   });

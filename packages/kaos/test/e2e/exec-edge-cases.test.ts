@@ -43,7 +43,7 @@ describe('e2e: exec edge cases', () => {
   let originalCwd: string;
 
   beforeEach(async () => {
-    kaos = new LocalKaos();
+    kaos = await LocalKaos.create();
     originalCwd = process.cwd();
     tempDir = await realpath(await mkdtemp(join(tmpdir(), 'kaos-exec-edge-')));
     await kaos.chdir(tempDir);
@@ -68,7 +68,7 @@ describe('e2e: exec edge cases', () => {
   });
 
   describe('kill() terminates a running child', () => {
-    it('long-running child can be killed with SIGTERM', async () => {
+    it.skipIf(process.platform === 'win32')('long-running child can be killed with SIGTERM', async () => {
       // A node script that sleeps forever.
       const proc = await kaos.exec('node', '-e', 'setInterval(() => {}, 1000 * 60);');
 
@@ -176,8 +176,8 @@ describe('e2e: exec edge cases', () => {
       await kaos.mkdir(subA);
       await kaos.mkdir(subB);
 
-      const kaosA = new LocalKaos();
-      const kaosB = new LocalKaos();
+      const kaosA = await LocalKaos.create();
+      const kaosB = await LocalKaos.create();
       await kaosA.chdir(subA);
       await kaosB.chdir(subB);
 

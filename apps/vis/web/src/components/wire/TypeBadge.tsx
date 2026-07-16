@@ -1,20 +1,20 @@
-import type { WireRecordType } from '../../types';
+import type { AgentRecord } from '../../types';
 import { Pill } from '../shared/Pill';
-import { TYPE_ICON, TYPE_TONE } from './typeMeta';
+import { rendererFor } from './renderers';
+
+type RecordType = AgentRecord['type'];
 
 interface TypeBadgeProps {
-  type: WireRecordType;
+  type: RecordType;
 }
 
 export function TypeBadge({ type }: TypeBadgeProps) {
-  const icon = TYPE_ICON[type];
-  const tone = TYPE_TONE[type];
+  const renderer = rendererFor(type);
+  const label = renderer?.label ?? type;
+  const tone = renderer?.tone ?? 'neutral';
   return (
-    <Pill tone={tone} variant="soft">
-      <span className="tabular" aria-hidden="true">
-        {icon}
-      </span>
-      <span>{type}</span>
+    <Pill tone={tone} variant="soft" title={type}>
+      {label}
     </Pill>
   );
 }

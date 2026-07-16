@@ -136,6 +136,7 @@ export function decodeTextWithErrors(
   data: Buffer,
   encoding: BufferEncoding,
   errors: 'strict' | 'replace' | 'ignore' = 'strict',
+  ignoreBOM: boolean = false,
 ): string {
   // Map Node's BufferEncoding names to Web TextDecoder labels where the two
   // diverge. Only UTF-family encodings participate in the strict/replace/
@@ -163,7 +164,7 @@ export function decodeTextWithErrors(
   }
 
   if (errors === 'strict') {
-    return new TextDecoder(webLabel, { fatal: true }).decode(data);
+    return new TextDecoder(webLabel, { fatal: true, ignoreBOM }).decode(data);
   }
 
   // 'ignore' must skip invalid input bytes/code units, not delete every
@@ -174,7 +175,7 @@ export function decodeTextWithErrors(
   }
 
   // 'replace' → substitute each invalid sequence with U+FFFD (default).
-  return new TextDecoder(webLabel, { fatal: false }).decode(data);
+  return new TextDecoder(webLabel, { fatal: false, ignoreBOM }).decode(data);
 }
 
 /**
@@ -203,6 +204,9 @@ export function globPatternToRegex(pattern: string, caseSensitive: boolean): Reg
           // leading `^` must remain literal even though JS regex char
           // classes treat it as negation in the first position.
           let charClass = pattern.slice(i + 1, end);
+          // Escape backslashes inside the class so a trailing backslash
+          // does not accidentally escape the closing `]`.
+          charClass = charClass.replace(/\\/g, '\\\\');
           if (charClass.startsWith('!')) {
             charClass = '^' + charClass.slice(1);
           } else if (charClass.startsWith('^')) {
@@ -213,8 +217,20 @@ export function globPatternToRegex(pattern: string, caseSensitive: boolean): Reg
         }
         break;
       }
+      case '\\': {
+        if (i + 1 < pattern.length) {
+          const next = pattern.charAt(i + 1);
+          regex += next.replaceAll(/[{}()+.\\[\]^$|]/g, '\\$&');
+          // Advance past the escaped character so it is not processed
+          // again as a regex metacharacter. match literally.
+          i++;
+        } else {
+          regex += '\\\\';
+        }
+        break;
+      }
       default:
-        regex += ch.replaceAll(/[{}()+.\\^$|]/g, '\\$&');
+        regex += ch.replaceAll(/[{}()+.\\[\]^$|]/g, '\\$&');
     }
   }
   regex += '$';
@@ -252,6 +268,7 @@ export class BufferedReadable extends Readable {
     this._source.off('end', this._onEnd);
     this._source.off('close', this._onClose);
     this._source.off('error', this._onError);
+    this._source.destroy();
     callback(error);
   }
 

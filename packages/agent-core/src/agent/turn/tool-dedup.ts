@@ -1,17 +1,41 @@
 import type { ContentPart } from '@moonshot-ai/kosong';
 
+import type { TelemetryClient } from '../../telemetry';
+import type { LLMRequestTrace } from '../../loop/llm';
 import type { ExecutableToolResult } from '../../loop/types';
 
 import { canonicalTelemetryArgs } from './canonical-args';
 
-const CROSS_STEP_DEDUP_TRIGGER_COUNT = 7;
-
-const REMINDER_TEXT =
+const REMINDER_TEXT_1 =
   '\n\n<system-reminder>\n' +
-  'You are repeating the exact same tool call with identical parameters.' +
-  ' Please carefully analyze the previous result. If the task is not yet complete,' +
-  ' try a different method or parameters instead of repeating the same call.' +
+  'The same tool call has been repeated several times in a row. ' +
+  'Before making your next call, write one sentence stating what new information you expect it to produce. ' +
+  'Then act on that sentence: if it names something this result does not already give you, choose the action that best provides it; otherwise, continue with the evidence you already have.' +
   '\n</system-reminder>';
+
+function makeReminderText2(repeatCount: number): string {
+  return (
+    '\n\n<system-reminder>\n' +
+    `The same tool call has now been issued ${String(repeatCount)} times in a row. ` +
+    'Choose exactly one of the following and state your choice before acting:\n' +
+    '(1) Falsification check: run the cheapest test that could conclusively disprove your current approach, if such a test exists.\n' +
+    '(2) Missing input: tell the user precisely what information or decision you need to proceed, and ask for it.\n' +
+    '(3) Conclude: deliver your best result based on the evidence already gathered, listing anything that remains uncertain.' +
+    '\n</system-reminder>'
+  );
+}
+
+const REMINDER_TEXT_3 =
+  '\n\n<system-reminder>\n' +
+  'Write your final response now, without any further tool calls. ' +
+  'Cover: the current blocker, each approach you have tried and what it established, and the specific information or decision you need from the user to unblock progress. ' +
+  'Text only.' +
+  '\n</system-reminder>';
+
+const REPEAT_REMINDER_1_START = 3;
+const REPEAT_REMINDER_2_START = 5;
+const REPEAT_REMINDER_3_START = 8;
+const REPEAT_FORCE_STOP_STREAK = 12;
 
 interface Deferred<T> {
   readonly promise: Promise<T>;
@@ -30,24 +54,32 @@ function makeKey(toolName: string, args: unknown): string {
   return `${toolName} ${canonicalTelemetryArgs(args)}`;
 }
 
-function appendReminder(result: ExecutableToolResult): ExecutableToolResult {
+function appendReminder(result: ExecutableToolResult, reminderText: string): ExecutableToolResult {
   const output = result.output;
   let newOutput: string | ContentPart[];
   if (typeof output === 'string') {
-    newOutput = output + REMINDER_TEXT;
+    newOutput = output + reminderText;
   } else {
     const arr: ContentPart[] = [...output];
     const last = arr.at(-1);
     if (last !== undefined && last.type === 'text') {
-      arr[arr.length - 1] = { type: 'text', text: last.text + REMINDER_TEXT };
+      arr[arr.length - 1] = { type: 'text', text: last.text + reminderText };
     } else {
-      arr.push({ type: 'text', text: REMINDER_TEXT });
+      arr.push({ type: 'text', text: reminderText });
     }
     newOutput = arr;
   }
   return result.isError === true
     ? { ...result, output: newOutput, isError: true }
     : { ...result, output: newOutput };
+}
+
+function forceStopResult(
+  result: ExecutableToolResult,
+  reminderText: string,
+): ExecutableToolResult {
+  const withReminder = appendReminder(result, reminderText);
+  return { ...withReminder, stopTurn: true };
 }
 
 /**
@@ -67,10 +99,19 @@ const DEDUP_PLACEHOLDER_RESULT: ExecutableToolResult = { output: '' };
  * Two behaviours are layered:
  * - Same-step dedup: a duplicate `(toolName, args)` issued in the same LLM step
  *   reuses the original call's result instead of executing the tool twice.
- * - Cross-step dedup: when the exact same call is repeated for
- *   `CROSS_STEP_DEDUP_TRIGGER_COUNT` consecutive occurrences (counting across
- *   steps), the result returned to the model is suffixed with a system reminder
- *   nudging it to try a different approach.
+ * - Cross-step dedup: when the exact same call is repeated consecutively
+ *   across steps, the result returned to the model is suffixed with a system
+ *   reminder once the streak hits 3. The reminder escalates as the streak
+ *   grows: r1 (expectation-setting nudge) from streak 3, r2 (forced decision
+ *   menu) from streak 5, r3 (final hand-off instruction) from streak 8. From streak 12
+ *   onward the turn is force-stopped via `{ stopTurn: true }` so the loop
+ *   cannot keep spinning on the same call. Force-stop does not flip a
+ *   successful tool result into an error — the underlying tool's `isError`
+ *   is preserved.
+ *
+ * Telemetry: every finalized original call with streak >= 2 emits a
+ * `tool_call_repeat` event carrying the current streak count as `repeat_count`
+ * along with the tool name and which action was taken (none/r1/r2/r3/stop).
  */
 export class ToolCallDeduplicator {
   private stepDeferreds = new Map<string, Deferred<ExecutableToolResult>>();
@@ -88,8 +129,17 @@ export class ToolCallDeduplicator {
   private callKeyByCallId = new Map<string, string>();
   private consecutiveKey: string | null = null;
   private consecutiveCount = 0;
+  private readonly telemetry: TelemetryClient | undefined;
+  private requestTrace: LLMRequestTrace | undefined;
 
-  beginStep(): void {
+  constructor(options?: {
+    readonly telemetry?: TelemetryClient | undefined;
+  }) {
+    this.telemetry = options?.telemetry;
+  }
+
+  beginStep(trace?: LLMRequestTrace): void {
+    this.requestTrace = trace;
     for (const deferred of this.stepDeferreds.values()) {
       deferred.resolve({
         output: 'Tool call deduplicated but original result was lost',
@@ -150,8 +200,8 @@ export class ToolCallDeduplicator {
    */
   async finalizeResult(
     toolCallId: string,
-    _toolName: string,
-    _args: unknown,
+    toolName: string,
+    args: unknown,
     result: ExecutableToolResult,
   ): Promise<ExecutableToolResult> {
     // Use the key recorded at registration time, NOT a fresh key from the args
@@ -181,8 +231,30 @@ export class ToolCallDeduplicator {
       }
     }
 
-    const finalResult =
-      streak >= CROSS_STEP_DEDUP_TRIGGER_COUNT ? appendReminder(result) : result;
+    let finalResult = result;
+    let action: 'none' | 'r1' | 'r2' | 'r3' | 'stop' = 'none';
+    if (streak >= REPEAT_FORCE_STOP_STREAK) {
+      finalResult = forceStopResult(result, REMINDER_TEXT_3);
+      action = 'stop';
+    } else if (streak >= REPEAT_REMINDER_3_START) {
+      finalResult = appendReminder(result, REMINDER_TEXT_3);
+      action = 'r3';
+    } else if (streak >= REPEAT_REMINDER_2_START) {
+      finalResult = appendReminder(result, makeReminderText2(streak));
+      action = 'r2';
+    } else if (streak >= REPEAT_REMINDER_1_START) {
+      finalResult = appendReminder(result, REMINDER_TEXT_1);
+      action = 'r1';
+    }
+
+    if (streak >= 2) {
+      this.telemetry?.track('tool_call_repeat', {
+        tool_name: toolName,
+        repeat_count: streak,
+        action,
+        trace_id: this.requestTrace?.traceId,
+      });
+    }
 
     this.stepDeferreds.get(key)?.resolve(finalResult);
     return finalResult;
@@ -190,6 +262,11 @@ export class ToolCallDeduplicator {
 }
 
 export const __testing = {
-  CROSS_STEP_DEDUP_TRIGGER_COUNT,
-  REMINDER_TEXT,
+  REMINDER_TEXT_1,
+  REMINDER_TEXT_3,
+  makeReminderText2,
+  REPEAT_REMINDER_1_START,
+  REPEAT_REMINDER_2_START,
+  REPEAT_REMINDER_3_START,
+  REPEAT_FORCE_STOP_STREAK,
 };

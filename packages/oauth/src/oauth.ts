@@ -10,16 +10,20 @@
  * when to poll / refresh / store.
  */
 
-import { OAuthError, OAuthUnauthorizedError, RetryableRefreshError } from './errors';
+import { extractApiErrorMessage } from './api-error';
+import {
+  OAuthConnectionError,
+  OAuthError,
+  OAuthUnauthorizedError,
+  RetryableRefreshError,
+} from './errors';
 import type { DeviceAuthorization, DeviceHeaders, OAuthFlowConfig, TokenInfo } from './types';
 import { isRecord } from './utils';
 
 const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 
 function pickErrorDetail(data: Record<string, unknown>): string {
-  if (typeof data['error_description'] === 'string') return data['error_description'];
-  if (typeof data['error'] === 'string') return data['error'];
-  return 'unknown';
+  return extractApiErrorMessage(data) ?? 'unknown';
 }
 
 function tokenFromResponse(payload: Record<string, unknown>): TokenInfo {
@@ -77,18 +81,15 @@ async function postForm(
       signal,
     });
   } catch (error) {
-    throw new OAuthError(
+    throw new OAuthConnectionError(
       `OAuth request to ${url} failed: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
   const status = response.status;
   let data: Record<string, unknown> = {};
   try {
-    const text = await response.text();
-    if (text.length > 0) {
-      const parsed: unknown = JSON.parse(text);
-      if (isRecord(parsed)) data = parsed;
-    }
+    const parsed: unknown = await response.json();
+    if (isRecord(parsed)) data = parsed;
   } catch {
     // Non-JSON response — leave data empty; caller interprets by status.
   }
@@ -109,7 +110,9 @@ export async function requestDeviceAuthorization(
   );
 
   if (status !== 200) {
-    throw new OAuthError(`Device authorization failed (HTTP ${status}): ${pickErrorDetail(data)}`);
+    throw new OAuthError(
+      `Device authorization failed (HTTP ${status}): ${pickErrorDetail(data)}`,
+    );
   }
 
   // Required-field validation for the device authorization response.
@@ -171,8 +174,9 @@ export async function pollDeviceToken(
   }
 
   const errorCode = typeof data['error'] === 'string' ? data['error'] : 'unknown_error';
+  const detail = extractApiErrorMessage(data);
   const description =
-    typeof data['error_description'] === 'string' ? data['error_description'] : '';
+    typeof data['error_description'] === 'string' ? data['error_description'] : (detail ?? '');
   switch (errorCode) {
     case 'authorization_pending':
     case 'slow_down':
@@ -183,7 +187,7 @@ export async function pollDeviceToken(
       return { kind: 'denied', description };
     default:
       throw new OAuthError(
-        `Device token polling failed (HTTP ${status}): ${errorCode} ${description}`,
+        `Device token polling failed (HTTP ${status}): ${detail ?? `${errorCode} ${description}`}`,
       );
   }
 }
@@ -246,18 +250,12 @@ export async function refreshAccessToken(
     }
 
     const errorCode = typeof data['error'] === 'string' ? data['error'] : '';
+    const detail = extractApiErrorMessage(data);
     if (status === 401 || status === 403 || errorCode === 'invalid_grant') {
-      throw new OAuthUnauthorizedError(
-        typeof data['error_description'] === 'string'
-          ? data['error_description']
-          : 'Token refresh unauthorized.',
-      );
+      throw new OAuthUnauthorizedError(detail ?? 'Token refresh unauthorized.');
     }
 
-    const desc =
-      typeof data['error_description'] === 'string'
-        ? data['error_description']
-        : `Token refresh failed (HTTP ${status}).`;
+    const desc = detail ?? `Token refresh failed (HTTP ${status}).`;
     if (RETRYABLE_STATUSES.has(status)) {
       lastError = new RetryableRefreshError(desc);
       if (attempt < maxRetries - 1) {

@@ -1,66 +1,80 @@
 /**
- * GlobTool — file pattern matching.
+ * GlobTool — file pattern matching via ripgrep.
  *
  * Finds files matching a glob pattern, returned sorted by modification
- * time (most recent first). Uses `kaos.glob`.
+ * time (most recent first). Implemented by shelling out to `rg --files`
+ * through Kaos — sharing the ripgrep binary, subprocess plumbing, and
+ * gitignore / sensitive-file handling with GrepTool.
  *
  * Output convention: `content` shown to the LLM is relativized to the
- * search base to save tokens; `output.paths` keeps absolute paths so
- * downstream Read/Edit can consume them directly.
+ * search base only when the base is inside the primary workspace. External
+ * roots stay absolute so downstream Read/Edit target the same file.
  *
- * Safety rails:
- *   - Pure-wildcard patterns (nothing but `*` / `?` / `/`) are rejected
- *     because they have no literal anchor — they would enumerate every
- *     file under the search root and exhaust the caller's context on
- *     large trees. Examples: `**`, `** / *`, `** / **`, `* / *`.
- *     Constrained patterns (with any literal anchor such as an extension
- *     or subdirectory) are allowed — the literal bounds the result set.
- *   - Patterns using brace expansion (`{a,b,c}`) are rejected up-front
- *     because the underlying `_globWalk` treats `{` / `}` as literals,
- *     so such patterns would silently match zero files.
- *   - `path` is validated by `resolvePathAccess` in strict mode. Explicit
- *     paths must be absolute and within the workspace roots.
- *   - match count is capped at `MAX_MATCHES`; a separate `YIELD_SAFETY_CAP`
- *     (MAX_MATCHES × 2) on the raw yield stream is a secondary belt that
- *     still terminates the stream if the kaos layer's own symlink-cycle
- *     detection were ever absent or bypassed. Primary cycle defense lives
- *     in `packages/kaos/src/local.ts:_globWalk` via a path-local visited
- *     inode set.
+ * Behaviour:
+ *   - `.gitignore` / `.ignore` / `.rgignore` are respected by default
+ *     (ripgrep native). Pass `include_ignored` to also surface ignored
+ *     files (e.g. build outputs, `node_modules`). Sensitive files such
+ *     as `.env` are always filtered out.
+ *   - Brace expansion (`*.{ts,tsx}`, `{src,test}/**`) is handled by
+ *     ripgrep's glob engine.
+ *   - `path` is validated by `resolvePathAccess` in `absolute-outside-allowed`
+ *     mode. Explicit absolute paths outside the workspace are allowed; relative
+ *     paths that escape the workspace stay rejected.
+ *   - Match count is capped at `MAX_MATCHES`. Callers are expected to add an
+ *     anchor (extension, subdirectory) when that would not be enough.
  */
 
 import type { Kaos } from '@moonshot-ai/kaos';
+import { normalize, resolve } from 'pathe';
 import { z } from 'zod';
 
 import type { BuiltinTool } from '../../../agent/tool';
+import { isAbortError } from '../../../loop/errors';
 import { ToolAccesses } from '../../../loop/tool-access';
 import type { ExecutableToolResult, ToolExecution } from '../../../loop/types';
-import { resolvePathAccessPath } from '../../policies/path-access';
+import { noopTelemetryClient, type TelemetryClient } from '../../../telemetry';
+import { isWithinDirectory, resolvePathAccessPath } from '../../policies/path-access';
 import type { PathClass } from '../../policies/path-access';
+import { isSensitiveFile } from '../../policies/sensitive';
 import { toInputJsonSchema } from '../../support/input-schema';
-import { listDirectory } from '../../support/list-directory';
+import { ensureRgPath, rgUnavailableMessage } from '../../support/rg-locator';
+import { literalRulePattern, matchesGlobRuleSubject } from '../../support/rule-match';
+import {
+  DEFAULT_TIMEOUT_MS,
+  MAX_OUTPUT_BYTES,
+  SENSITIVE_GLOBS_TO_EXCLUDE,
+  VCS_DIRECTORIES_TO_EXCLUDE,
+  runRipgrepOnce,
+  shouldRetryRipgrepEagain,
+} from '../../support/run-rg';
 import type { WorkspaceConfig } from '../../support/workspace';
-import GLOB_DESCRIPTION from './glob.md';
+import GLOB_DESCRIPTION from './glob.md?raw';
 
 export const GlobInputSchema = z.object({
-  pattern: z.string().describe('Glob pattern to match files/directories.'),
+  pattern: z.string().describe('Glob pattern to match files.'),
   path: z
     .string()
     .optional()
     .describe(
-      'Absolute path to the directory to search in. Defaults to the current working directory.',
+      'Directory to search. Accepts an absolute path, or a path relative to the current working directory. Defaults to the current working directory.',
+    ),
+  include_ignored: z
+    .boolean()
+    .optional()
+    .describe(
+      'Also match files excluded by ignore files such as `.gitignore`, `.ignore`, and `.rgignore` (for example `node_modules` or build outputs). Sensitive files (such as `.env`) remain filtered out for safety. VCS metadata directories (`.git` and similar) are always skipped, even when this is true. Defaults to false.',
     ),
   include_dirs: z
     .boolean()
-    .default(true)
     .optional()
     .describe(
-      'Whether to include directories in results. Defaults to true. Set false to return only files.',
+      'Deprecated and ignored. Results are always files-only — directories are never listed. Accepted only so older calls that still pass this flag are not rejected by parameter validation.',
     ),
 });
 
-export type GlobInput = z.Infer<typeof GlobInputSchema>;
+export type GlobInput = z.infer<typeof GlobInputSchema>;
 
-export const MAX_MATCHES = 1000;
+export const MAX_MATCHES = 100;
 
 /**
  * Path-shape hint appended to the tool description only on a Windows
@@ -76,27 +90,28 @@ export const WINDOWS_PATH_HINT =
   'returned in Windows backslash form; convert them to forward slashes before ' +
   'using them in a Bash command.';
 
-// POSIX mode bits — same constants used by KaosPath.isDir (packages/kaos/src/path.ts:199).
+// POSIX mode bits for the search-root directory check.
 const S_IFMT = 0o170000;
 const S_IFDIR = 0o040000;
 
 /**
  * Tool-level description shown to the LLM at tool declaration time.
- * Tells the model — before any round-trip — which patterns are
- * accepted, which are rejected, and which directories are too large to
- * recurse into. Patterns with a literal anchor before a double-star are
- * allowed; pure-wildcard patterns (a bare double-star or a double-star
- * followed by `/<wildcard>`) are rejected outright. On a Windows backend
- * the description also carries `WINDOWS_PATH_HINT` (path-shape guidance).
+ * Tells the model — before any round-trip — which patterns are accepted,
+ * how brace expansion is handled, and which directories are too large to
+ * recurse into. On a Windows backend the description also carries
+ * `WINDOWS_PATH_HINT` (path-shape guidance).
  */
 export class GlobTool implements BuiltinTool<GlobInput> {
   readonly name = 'Glob' as const;
   readonly description: string;
   readonly parameters: Record<string, unknown> = toInputJsonSchema(GlobInputSchema);
+  private readonly telemetry: TelemetryClient;
   constructor(
     private readonly kaos: Kaos,
     private readonly workspace: WorkspaceConfig,
+    telemetry: TelemetryClient = noopTelemetryClient,
   ) {
+    this.telemetry = telemetry;
     this.description =
       this.kaos.pathClass() === 'win32'
         ? GLOB_DESCRIPTION + WINDOWS_PATH_HINT
@@ -110,196 +125,249 @@ export class GlobTool implements BuiltinTool<GlobInput> {
         kaos: this.kaos,
         workspace: this.workspace,
         operation: 'search',
-        policy: { guardMode: 'strict', checkSensitive: false },
+        policy: { guardMode: 'absolute-outside-allowed', checkSensitive: false },
       });
     }
     const searchRoots = [path ?? this.workspace.workspaceDir];
+
+    const detailParts: string[] = [`pattern: ${args.pattern}`];
+    if (args.path !== undefined) {
+      detailParts.push(`path: ${args.path}`);
+    }
+    if (args.include_ignored === true) {
+      detailParts.push('include_ignored: true');
+    }
+
     return {
       accesses: ToolAccesses.searchTree(searchRoots[0]!),
       description: `Searching ${args.pattern}`,
-      execute: () => this.execution(args, searchRoots),
+      display: {
+        kind: 'file_io',
+        operation: 'glob',
+        path: searchRoots[0]!,
+        detail: detailParts.join(', '),
+      },
+      approvalRule: literalRulePattern(this.name, args.pattern),
+      matchesRule: (ruleArgs) => matchesGlobRuleSubject(ruleArgs, args.pattern),
+      execute: ({ signal }) => this.execution(args, signal, searchRoots),
     };
   }
 
-  private async execution(args: GlobInput, searchRoots: string[]): Promise<ExecutableToolResult> {
-    if (startsWithDoubleStarPrefix(args.pattern)) {
-      let tree: string;
-      try {
-        tree = await listDirectory(this.kaos, this.workspace.workspaceDir);
-      } catch {
-        tree = '(listing unavailable)';
-      }
-      return {
-        isError: true,
-        output:
-          `Pattern "${args.pattern}" starts with '**' which is not allowed — ` +
-          `the leading '**/' has no literal anchor in front of it and would ` +
-          `enumerate every file under the search root, typically exhausting ` +
-          `the caller's context on large trees. Use more specific patterns ` +
-          `instead, such as "src/**/*.py" or "test/**/*.py".\n\n` +
-          `Top of ${this.workspace.workspaceDir}:\n${tree}`,
-      };
-    }
+  private async execution(
+    args: GlobInput,
+    signal: AbortSignal,
+    searchRoots: string[],
+  ): Promise<ExecutableToolResult> {
+    const searchRoot = searchRoots[0] ?? this.workspace.workspaceDir;
 
-    if (isPureWildcard(args.pattern)) {
-      const allowedRoots = [this.workspace.workspaceDir, ...this.workspace.additionalDirs];
-      const rootList = allowedRoots.map((d) => `  - ${d}`).join('\n');
-      let tree: string;
-      try {
-        tree = await listDirectory(this.kaos, this.workspace.workspaceDir);
-      } catch {
-        tree = '(listing unavailable)';
-      }
-      return {
-        isError: true,
-        output:
-          `Pattern "${args.pattern}" is a pure wildcard (only \`*\`, \`?\`, \`**\`, \`/\`) ` +
-          `and would enumerate every file under the search root — with no literal ` +
-          `anchor to bound the result set, this typically exhausts your context on ` +
-          `large trees. Add an extension ` +
-          `("${args.pattern === '**' || args.pattern === '**/*' ? '**/*.ts' : '**/*.md'}") ` +
-          `or a subdirectory ("src/**/*.ts") to constrain the walk.\n\n` +
-          `Allowed roots for explicit path searches:\n${rootList}\n\n` +
-          `Top of ${this.workspace.workspaceDir}:\n${tree}`,
-      };
-    }
-
-    if (containsBraceExpansion(args.pattern)) {
-      return {
-        isError: true,
-        output:
-          `Pattern "${args.pattern}" uses brace expansion (\`{a,b,...}\`), which ` +
-          `is not supported by this Glob tool. Split it into separate calls, ` +
-          `one pattern per alternative. For example, instead of "*.{ts,tsx}" ` +
-          `issue two calls: "*.ts" and "*.tsx".`,
-      };
-    }
-
-    // Default true. When false, directories yielded by kaos are
-    // filtered out using the same stat that fuels the mtime sort
-    // (no second stat per path).
-    const includeDirs = args.include_dirs ?? true;
-
-    // kaos.glob silently returns empty for missing or non-directory roots
-    // (its _globWalk catches the readdir failure and exits without yielding).
-    // Without this pre-check, a Glob against a missing path would report
-    // "No matches found" instead of "does not exist", and the model would
-    // not realize the search root itself was wrong. iterdir is the right
-    // signal: pulling one entry triggers the same readdir that kaos.glob
-    // would do, so ENOENT/ENOTDIR surface here for the realistic backends
-    // before the walker is invoked. Any other failure (e.g. an unmocked
-    // test backend that throws "not implemented") falls through silently
-    // so the existing kaos.glob path still runs.
-    for (const root of searchRoots) {
-      try {
-        const iter = this.kaos.iterdir(root);
-        await iter.next();
-        if (typeof iter.return === 'function') {
-          await iter.return(undefined);
-        }
-      } catch (error) {
-        if (error !== null && typeof error === 'object' && 'code' in error) {
-          const code = (error as { code?: string }).code;
-          if (code === 'ENOENT') {
-            return { isError: true, output: `${root} does not exist` };
-          }
-          if (code === 'ENOTDIR') {
-            return { isError: true, output: `${root} is not a directory` };
-          }
-        }
-        // Unknown failure (including unmocked test backends): fall
-        // through and let kaos.glob run; it will either yield results
-        // or its own catch path will surface the error.
-      }
-    }
-
+    // Validate the search root is a directory. `rg --files <file>` exits 0
+    // and lists the file itself, so without this check a file root would be
+    // returned as its own match instead of rejected. A missing root surfaces
+    // here as "does not exist".
     try {
-      // Two counters, two jobs:
-      //   - `entries.length` caps the *unique* paths we return, so a
-      //     truncation warning only fires after MAX_MATCHES real hits.
-      //   - `yielded` counts every path the kaos stream emits, including
-      //     duplicates. Secondary safety belt: the kaos `_globWalk`
-      //     itself detects symlink cycles, so a well-formed kaos layer
-      //     never re-yields the same real
-      //     file. `yielded` still terminates the stream if that primary
-      //     defense were ever absent or bypassed (e.g. a future kaos
-      //     backend without inode tracking), so the tool layer doesn't
-      //     depend on the kaos implementation for cycle safety.
-      const seen = new Set<string>();
-      const entries: Array<{ path: string; mtime: number }> = [];
-      const YIELD_SAFETY_CAP = MAX_MATCHES * 2;
-      let yielded = 0;
-      let truncated = false;
-
-      outer: for (const root of searchRoots) {
-        for await (const filePath of this.kaos.glob(root, args.pattern)) {
-          yielded++;
-          if (yielded >= YIELD_SAFETY_CAP) {
-            truncated = true;
-            break outer;
-          }
-          if (seen.has(filePath)) continue;
-          if (entries.length >= MAX_MATCHES) {
-            truncated = true;
-            break outer;
-          }
-          seen.add(filePath);
-          let mtime = 0;
-          let isDir = false;
-          try {
-            const st = await this.kaos.stat(filePath);
-            mtime = st.stMtime ?? 0;
-            isDir = (st.stMode & S_IFMT) === S_IFDIR;
-          } catch {
-            // stat failure — use 0 mtime / assume file so it still surfaces
-          }
-          // Apply include_dirs *after* marking seen so a filtered dir
-          // doesn't re-enter via a later duplicate yield, and *before*
-          // pushing to entries so MAX_MATCHES continues to cap output
-          // (not pre-filter) size.
-          if (!includeDirs && isDir) continue;
-          entries.push({ path: filePath, mtime });
-        }
+      const st = await this.kaos.stat(searchRoot);
+      if ((st.stMode & S_IFMT) !== S_IFDIR) {
+        return { isError: true, output: `${searchRoot} is not a directory` };
       }
-
-      entries.sort((a, b) => b.mtime - a.mtime);
-
-      const paths = entries.map((e) => e.path);
-      // Content shown to the LLM uses paths relative to the search base
-      // to save tokens; `output.paths` keeps the absolute form so callers
-      // can feed them into Read/Edit without further resolution.
-      const pathClass = this.kaos.pathClass();
-      const relBase = searchRoots[0] ?? this.workspace.workspaceDir;
-      const displayLines = paths.map((p) => relativizeIfUnder(p, relBase, pathClass));
-
-      if (entries.length === 0 && !truncated) {
-        return { output: 'No matches found' };
-      }
-      const lines: string[] = [];
-      if (truncated) {
-        lines.push(`[Truncated at ${String(MAX_MATCHES)} matches — use a more specific pattern]`);
-        lines.push(`Only the first ${String(MAX_MATCHES)} matches are returned.`);
-      }
-      lines.push(...displayLines);
-      if (!truncated && entries.length === MAX_MATCHES) {
-        lines.push(`Found ${String(entries.length)} matches`);
-      }
-      return { output: lines.join('\n') };
     } catch (error) {
-      if (error !== null && typeof error === 'object' && 'code' in error) {
-        const code = (error as { code?: string }).code;
-        const path = searchRoots[0] ?? this.workspace.workspaceDir;
-        if (code === 'ENOENT') {
-          return { isError: true, output: `${path} does not exist` };
-        }
-        if (code === 'ENOTDIR') {
-          return { isError: true, output: `${path} is not a directory` };
-        }
+      if (errorCode(error) === 'ENOENT') {
+        return { isError: true, output: `${searchRoot} does not exist` };
       }
       return { isError: true, output: error instanceof Error ? error.message : String(error) };
     }
-  }
 
+    let rgPath: string;
+    try {
+      const resolution = await ensureRgPath({ signal });
+      rgPath = resolution.path;
+      if (resolution.source !== 'system-path') {
+        this.telemetry.track('glob_tool_rg_fallback', {
+          source: resolution.source,
+          outcome: 'resolved',
+        });
+      }
+    } catch (error) {
+      if (isAbortError(error)) {
+        return { isError: true, output: 'Glob aborted' };
+      }
+      this.telemetry.track('glob_tool_rg_fallback', { outcome: 'failed' });
+      return { isError: true, output: rgUnavailableMessage(error) };
+    }
+
+    // Run rg with its cwd pinned to the search root and `.` as the search
+    // path. ripgrep matches `--glob` patterns against the path *as passed to
+    // rg*, so with an absolute search path a pattern containing a `/` (e.g.
+    // `src/**/*.ts`) is matched against the absolute path and never matches.
+    // Running from the search root makes glob matching relative to it.
+    const execKaos = this.kaos.withCwd(searchRoot);
+
+    let runResult = await runRipgrepOnce(
+      execKaos,
+      buildRgArgs(rgPath, args),
+      signal,
+      { abortedMessage: 'Glob aborted' },
+    );
+    if (runResult.kind === 'tool-error') return runResult.result;
+    if (shouldRetryRipgrepEagain(runResult)) {
+      runResult = await runRipgrepOnce(
+        execKaos,
+        buildRgArgs(rgPath, args, true),
+        signal,
+        { abortedMessage: 'Glob aborted' },
+      );
+      if (runResult.kind === 'tool-error') return runResult.result;
+    }
+
+    const { exitCode, stdoutText, stderrText, bufferTruncated, timedOut } = runResult;
+
+    // rg exit codes: 0 = matches, 1 = no matches, 2+ = error. Timeout
+    // kills usually surface as a signal exit code; keep any partial paths.
+    // If rg returned complete paths before failing on a traversal error such
+    // as an unreadable subdirectory, keep those paths and surface a warning
+    // instead of failing the whole search. If no complete path was produced,
+    // treat stderr as authoritative (invalid glob, spawn failure, etc.).
+    let traversalWarning: string | undefined;
+    if (exitCode !== 0 && exitCode !== 1 && !timedOut) {
+      const rawPathsBeforeError = splitCompletePaths(stdoutText, true);
+      if (rawPathsBeforeError.length === 0) {
+        return { isError: true, output: formatGlobError(searchRoot, stderrText) };
+      }
+      traversalWarning = formatGlobWarning(stderrText);
+    }
+    if (signal.aborted) {
+      return { isError: true, output: 'Glob aborted' };
+    }
+
+    // One path per line from `rg --files`. When stdout is capped or the run
+    // timed out, the final chunk can cut a path in half; drop any trailing
+    // line that lacks its terminating newline so a half-written path is never
+    // surfaced as a match. Mirrors GrepTool's omitIncompleteTrailingRecord.
+    // rg reports paths relative to its cwd (the search root), e.g.
+    // `./src/a.ts`; resolve them back to absolute paths so the sensitive-file
+    // check, workspace relativization, and display all keep working on
+    // absolute paths as before.
+    const rawPaths = splitCompletePaths(stdoutText, bufferTruncated || timedOut).map((p) =>
+      resolve(searchRoot, p),
+    );
+
+    // Authoritative sensitive-file check (the rg prefilter is conservative).
+    const kept: string[] = [];
+    let filteredSensitive = 0;
+    for (const p of rawPaths) {
+      if (isSensitiveFile(p)) {
+        filteredSensitive++;
+      } else {
+        kept.push(p);
+      }
+    }
+
+    const truncated = kept.length > MAX_MATCHES;
+    const limited = truncated ? kept.slice(0, MAX_MATCHES) : kept;
+
+    if (limited.length === 0 && !timedOut) {
+      if (filteredSensitive > 0) {
+        return {
+          output: `No non-sensitive matches found (${String(filteredSensitive)} sensitive file(s) filtered).`,
+        };
+      }
+      return { output: 'No matches found' };
+    }
+
+    // Content shown to the LLM uses paths relative to the search base to
+    // save tokens, but only for the primary workspace. Relative paths are
+    // later resolved against workspaceDir, so additionalDir matches stay
+    // absolute to keep follow-up Read/Edit calls on the same file.
+    const pathClass = this.kaos.pathClass();
+    const shouldRelativize = isWithinDirectory(searchRoot, this.workspace.workspaceDir, pathClass);
+    const displayLines = limited.map((p) =>
+      shouldRelativize ? relativizeIfUnder(p, searchRoot, pathClass) : p,
+    );
+
+    const lines: string[] = [];
+    if (timedOut) {
+      lines.push(
+        `Glob timed out after ${String(DEFAULT_TIMEOUT_MS / 1000)}s; partial results returned.`,
+      );
+    }
+    if (bufferTruncated) {
+      lines.push(
+        `[stdout truncated at ${String(MAX_OUTPUT_BYTES)} bytes; results may be incomplete — use a more specific pattern]`,
+      );
+    }
+    if (traversalWarning !== undefined) {
+      lines.push(traversalWarning);
+    }
+    if (truncated) {
+      lines.push(`[Truncated at ${String(MAX_MATCHES)} matches — use a more specific pattern]`);
+      lines.push(`Only the first ${String(MAX_MATCHES)} matches are returned.`);
+    }
+    lines.push(...displayLines);
+    if (filteredSensitive > 0) {
+      lines.push(`Filtered ${String(filteredSensitive)} sensitive file(s).`);
+    }
+    if (!truncated && limited.length === MAX_MATCHES) {
+      lines.push(`Found ${String(limited.length)} matches`);
+    }
+    return { output: lines.join('\n') };
+  }
+}
+
+function buildRgArgs(rgPath: string, args: GlobInput, singleThreaded = false): string[] {
+  const cmd: string[] = [rgPath];
+  if (singleThreaded) cmd.push('-j', '1');
+  cmd.push('--files', '--hidden', '--sortr=modified');
+  for (const dir of VCS_DIRECTORIES_TO_EXCLUDE) {
+    cmd.push('--glob', `!${dir}`);
+  }
+  // Positive pattern first, then sensitive-file exclusions so a broad
+  // pattern cannot re-include a sensitive path.
+  cmd.push('--glob', args.pattern);
+  for (const glob of SENSITIVE_GLOBS_TO_EXCLUDE) {
+    cmd.push('--glob', `!${glob}`);
+  }
+  if (args.include_ignored) cmd.push('--no-ignore');
+  // Search path is `.` because the process cwd is pinned to the search root
+  // (see execution()); this keeps `--glob` matching relative to that root.
+  cmd.push('.');
+  return cmd;
+}
+
+function formatGlobError(searchRoot: string, stderr: string): string {
+  const trimmed = stderr.trim();
+  if (/no such file or directory/i.test(trimmed)) {
+    return `${searchRoot} does not exist`;
+  }
+  return trimmed.length > 0 ? `Glob failed: ${trimmed}` : 'Glob failed';
+}
+
+function formatGlobWarning(stderr: string): string {
+  const trimmed = stderr.trim();
+  return trimmed.length > 0
+    ? `Glob completed with warnings; some directories could not be read: ${trimmed}`
+    : 'Glob completed with warnings; some directories could not be read.';
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (error !== null && typeof error === 'object' && 'code' in error) {
+    const code = (error as { code?: unknown }).code;
+    return typeof code === 'string' ? code : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Split `rg --files` stdout into complete paths. When the run was capped or
+ * timed out (`truncatedOutput`), a path cut mid-write lacks its terminating
+ * newline; drop that trailing fragment so it is never surfaced as a match.
+ * Complete output always ends in `\n`, so the split is lossless in that case.
+ */
+export function splitCompletePaths(stdoutText: string, truncatedOutput: boolean): string[] {
+  let text = stdoutText;
+  if (truncatedOutput && !text.endsWith('\n')) {
+    const lastNewline = text.lastIndexOf('\n');
+    text = lastNewline >= 0 ? text.slice(0, lastNewline + 1) : '';
+  }
+  return text.split('\n').filter((p) => p.length > 0);
 }
 
 /**
@@ -308,69 +376,14 @@ export class GlobTool implements BuiltinTool<GlobInput> {
  * should be canonical absolute paths.
  */
 function relativizeIfUnder(candidate: string, base: string, pathClass: PathClass): string {
-  const sep = pathClass === 'win32' ? '\\' : '/';
-  const comparableCandidate = pathClass === 'win32' ? candidate.toLowerCase() : candidate;
-  const comparableBase = pathClass === 'win32' ? base.toLowerCase() : base;
+  const normCandidate = normalize(candidate);
+  const normBase = normalize(base);
+  const comparableCandidate = pathClass === 'win32' ? normCandidate.toLowerCase() : normCandidate;
+  const comparableBase = pathClass === 'win32' ? normBase.toLowerCase() : normBase;
   if (comparableCandidate === comparableBase) return '.';
-  const prefix = comparableBase.endsWith(sep) ? comparableBase : comparableBase + sep;
+  const prefix = comparableBase.endsWith('/') ? comparableBase : comparableBase + '/';
   if (comparableCandidate.startsWith(prefix)) {
-    return candidate.slice(prefix.length);
+    return normCandidate.slice(prefix.length);
   }
-  return candidate;
-}
-
-// Return true iff `pattern` begins with the literal sequence `**` followed
-// by a `/`. Such patterns have no literal anchor in front of the recursive
-// wildcard, so the walk has nothing to bound it on the left and would
-// descend into every top-level directory of the search root before any
-// suffix constraint can filter. Rejected up-front to match the Python Glob
-// behavior — callers must anchor with a top-level subdirectory.
-function startsWithDoubleStarPrefix(pattern: string): boolean {
-  return pattern.startsWith('**/');
-}
-
-/**
- * Return true if `pattern` is pure wildcards — only `*`, `?`, `**`, `/`.
- * Such patterns have no literal anchor and would enumerate every file
- * under the search root. Backslash-escaped characters (`\X`) count as
- * literals so `\*` or `\?` still means "pattern has an anchor".
- */
-function isPureWildcard(pattern: string): boolean {
-  if (pattern === '') return false;
-  for (let i = 0; i < pattern.length; i++) {
-    const ch = pattern[i];
-    if (ch === '\\' && i + 1 < pattern.length) {
-      // escaped literal — pattern has an anchor
-      return false;
-    }
-    if (ch !== '*' && ch !== '?' && ch !== '/') {
-      return false;
-    }
-  }
-  return true;
-}
-
-/** Return true iff `pattern` looks like it uses `{a,b,c}` brace expansion. */
-function containsBraceExpansion(pattern: string): boolean {
-  let inBrace = false;
-  let sawCommaInsideBrace = false;
-  for (let i = 0; i < pattern.length; i++) {
-    const ch = pattern[i];
-    if (ch === '\\' && i + 1 < pattern.length) {
-      i++;
-      continue;
-    }
-    if (ch === '{') {
-      inBrace = true;
-      sawCommaInsideBrace = false;
-      continue;
-    }
-    if (ch === '}') {
-      if (inBrace && sawCommaInsideBrace) return true;
-      inBrace = false;
-      continue;
-    }
-    if (ch === ',' && inBrace) sawCommaInsideBrace = true;
-  }
-  return false;
+  return normCandidate;
 }

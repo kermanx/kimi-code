@@ -1,15 +1,18 @@
-import type { ModelAlias } from '@moonshot-ai/kimi-code-sdk';
+import { effectiveModelAlias, type ModelAlias, type ThinkingEffort } from '@moonshot-ai/kimi-code-sdk';
 import {
   Container,
   Key,
   matchesKey,
   truncateToWidth,
+  visibleWidth,
+  wrapTextWithAnsi,
   type Focusable,
-} from '@earendil-works/pi-tui';
-import chalk from 'chalk';
+} from '@moonshot-ai/pi-tui';
 
 import { DEFAULT_OAUTH_PROVIDER_NAME, PRODUCT_NAME } from '#/constant/app';
-import type { ColorPalette } from '#/tui/theme/colors';
+import { CURRENT_MARK, SELECT_POINTER } from '#/tui/constant/symbols';
+import { currentTheme } from '#/tui/theme';
+import { SearchableList } from '#/tui/utils/searchable-list';
 
 import type { ChoiceOption } from './choice-picker';
 
@@ -18,16 +21,25 @@ type ThinkingAvailability = 'toggle' | 'always-on' | 'unsupported';
 interface ModelChoice {
   readonly alias: string;
   readonly model: ModelAlias;
+  /** Model display name (left column). */
+  readonly name: string;
+  /** Provider display name (right column). */
+  readonly provider: string;
+  /** Combined text the fuzzy filter matches against (name + provider). */
   readonly label: string;
 }
 
 export interface ModelSelection {
   readonly alias: string;
-  readonly thinking: boolean;
+  /** Chosen thinking effort: 'off', or a concrete effort such as 'low' /
+   * 'high' / 'max'. Boolean 'on' is normalized to the model's default effort
+   * before the selection is committed (see commitEffort). */
+  readonly thinking: ThinkingEffort;
 }
 
 export function modelDisplayName(alias: string, model: ModelAlias | undefined): string {
-  return model?.displayName ?? model?.model ?? alias;
+  const effective = model === undefined ? undefined : effectiveModelAlias(model);
+  return effective?.displayName ?? effective?.model ?? alias;
 }
 
 export function providerDisplayName(provider: string): string {
@@ -39,146 +51,344 @@ export function providerDisplayName(provider: string): string {
 export function createModelChoiceOptions(
   models: Record<string, ModelAlias>,
 ): readonly ChoiceOption[] {
-  return Object.entries(models).map(([alias, cfg]) => ({
-    value: alias,
-    label: `${modelDisplayName(alias, cfg)} (${providerDisplayName(cfg.provider)})`,
-  }));
+  return Object.entries(models).map(([alias, cfg]) => {
+    const effective = effectiveModelAlias(cfg);
+    return {
+      value: alias,
+      label: `${modelDisplayName(alias, effective)} (${providerDisplayName(effective.provider)})`,
+    };
+  });
 }
 
 export interface ModelSelectorOptions {
   readonly models: Record<string, ModelAlias>;
   readonly currentValue: string;
   readonly selectedValue?: string;
-  readonly currentThinking: boolean;
-  readonly colors: ColorPalette;
+  /** Live thinking effort of the currently active model (e.g. 'off', 'on',
+   * 'high'). Used to highlight the active segment for the current model. */
+  readonly currentThinkingEffort: ThinkingEffort;
+  /** When true, typed characters filter the list (fuzzy) and a search line is shown. */
+  readonly searchable?: boolean;
+  /** Items per page. Lists longer than this paginate (PgUp/PgDn). */
+  readonly pageSize?: number;
+  /** When true, the hint line mentions the Tab provider switch — set by
+   * TabbedModelSelectorComponent so the inner list advertises the tab keys. */
+  readonly providerSwitchHint?: boolean;
+  /** When set, rendered as warning-colored lines directly below the key-hint
+   * line; wraps instead of truncating when it exceeds the width (e.g. the
+   * mid-conversation switch cost notice). */
+  readonly warning?: string;
   readonly onSelect: (selection: ModelSelection) => void;
+  /** When provided, Alt+S invokes this instead of onSelect — used to apply the
+   * choice to the current session only, without persisting it as the default. */
+  readonly onSessionOnlySelect?: (selection: ModelSelection) => void;
   readonly onCancel: () => void;
 }
 
 function createModelChoices(models: Record<string, ModelAlias>): readonly ModelChoice[] {
-  return Object.entries(models).map(([alias, cfg]) => ({
-    alias,
-    model: cfg,
-    label: `${modelDisplayName(alias, cfg)} (${providerDisplayName(cfg.provider)})`,
-  }));
+  return Object.entries(models).map(([alias, cfg]) => {
+    const effective = effectiveModelAlias(cfg);
+    const name = modelDisplayName(alias, effective);
+    const provider = providerDisplayName(effective.provider);
+    return { alias, model: effective, name, provider, label: `${name} (${provider})` };
+  });
 }
 
-function thinkingAvailability(model: ModelAlias): ThinkingAvailability {
+export function thinkingAvailability(model: ModelAlias): ThinkingAvailability {
   const caps = model.capabilities ?? [];
   if (caps.includes('always_thinking')) return 'always-on';
-  if (caps.includes('thinking')) return 'toggle';
+  if (caps.includes('thinking') || model.adaptiveThinking === true) return 'toggle';
   return 'unsupported';
 }
 
-function effectiveThinking(model: ModelAlias, thinkingDraft: boolean): boolean {
-  const availability = thinkingAvailability(model);
-  if (availability === 'always-on') return true;
-  if (availability === 'unsupported') return false;
-  return thinkingDraft;
+export function effortsOf(model: ModelAlias): readonly string[] {
+  return model.supportEfforts ?? [];
 }
 
+/**
+ * Ordered list of selectable thinking efforts for a model. Effort-capable models
+ * expose their declared efforts (with an 'off' entry when the model is not
+ * always-on); legacy boolean models expose 'on'/'off'; single-segment lists
+ * mean the control is effectively locked.
+ */
+export function segmentsFor(model: ModelAlias): readonly string[] {
+  const efforts = effortsOf(model);
+  const availability = thinkingAvailability(model);
+  if (efforts.length > 0) {
+    return availability === 'always-on' ? efforts : ['off', ...efforts];
+  }
+  if (availability === 'always-on') return ['on'];
+  if (availability === 'unsupported') return ['off'];
+  return ['on', 'off'];
+}
+
+export function effortLabel(effort: string): string {
+  if (effort.length === 0) return effort;
+  return effort.charAt(0).toUpperCase() + effort.slice(1);
+}
+
+/**
+ * Default thinking effort for a model: declared `default_effort`, else the
+ * middle `support_efforts` entry, else `'on'` for boolean models, `'off'` when
+ * thinking is unsupported.
+ */
+function defaultThinkingEffortFor(model: ModelAlias): ThinkingEffort {
+  if (thinkingAvailability(model) === 'unsupported') return 'off';
+  const efforts = effortsOf(model);
+  if (efforts.length > 0) {
+    return model.defaultEffort ?? efforts[Math.floor(efforts.length / 2)]!;
+  }
+  return 'on';
+}
+
+/**
+ * Normalize a draft effort before committing a selection. A boolean `'on'`
+ * never leaks past the UI boundary — it becomes the model's default effort
+ * (a concrete effort for effort-capable models, `'on'` only for genuine
+ * boolean models).
+ */
+function commitEffort(choice: ModelChoice, draft: ThinkingEffort): ThinkingEffort {
+  if (draft === 'on') return defaultThinkingEffortFor(choice.model);
+  return draft;
+}
+
+/**
+ * Flat, searchable single-list model picker.
+ *
+ * One navigation axis: ↑/↓ move the cursor (PgUp/PgDn page), typing fuzzy-filters
+ * across every provider (provider name included), and ←/→ toggle the thinking
+ * draft for models that support it. There are no provider tabs — filtering by
+ * typing a provider name replaces them. See .agents/skills/write-tui/DESIGN.md.
+ */
 export class ModelSelectorComponent extends Container implements Focusable {
   focused = false;
   private readonly opts: ModelSelectorOptions;
-  private readonly choices: readonly ModelChoice[];
-  private selectedIndex: number;
-  private thinkingDraft: boolean;
+  private readonly list: SearchableList<ModelChoice>;
+  /** Per-model thinking-effort override set by ←/→; absent → the default. */
+  private readonly thinkingOverrides = new Map<string, string>();
 
   constructor(opts: ModelSelectorOptions) {
     super();
     this.opts = opts;
-    this.choices = createModelChoices(opts.models);
+    const choices = createModelChoices(opts.models);
     const selectedValue = opts.selectedValue ?? opts.currentValue;
-    const selectedIdx = this.choices.findIndex((choice) => choice.alias === selectedValue);
-    this.selectedIndex = Math.max(selectedIdx, 0);
-    this.thinkingDraft = opts.currentThinking;
+    const selectedIdx = choices.findIndex((choice) => choice.alias === selectedValue);
+    this.list = new SearchableList({
+      items: choices,
+      toSearchText: (choice) => choice.label,
+      pageSize: opts.pageSize,
+      initialIndex: Math.max(selectedIdx, 0),
+      searchable: opts.searchable === true,
+    });
+  }
+
+  /**
+   * Thinking effort for a model: an explicit ←/→ override when set, otherwise
+   * the live effort for the active model, otherwise the model's default effort
+   * (effort-capable) or 'on' (other thinking-capable models).
+   */
+  private draftFor(choice: ModelChoice): string {
+    const override = this.thinkingOverrides.get(choice.alias);
+    if (override !== undefined) return override;
+    if (choice.alias === this.opts.currentValue) return this.opts.currentThinkingEffort;
+    const efforts = effortsOf(choice.model);
+    if (efforts.length > 0) {
+      // A model with support_efforts but no default_effort defaults to the
+      // middle entry of its supported efforts.
+      const def = choice.model.defaultEffort ?? efforts[Math.floor(efforts.length / 2)];
+      if (def !== undefined && efforts.includes(def)) return def;
+      return efforts[0]!;
+    }
+    return thinkingAvailability(choice.model) !== 'unsupported' ? 'on' : 'off';
+  }
+
+  /** Draft coerced onto the model's segment list so rendering/selection never
+   * reference a effort the model cannot actually select. */
+  private effectiveEffort(choice: ModelChoice): string {
+    const draft = this.draftFor(choice);
+    const segments = segmentsFor(choice.model);
+    return segments.includes(draft) ? draft : segments[0]!;
   }
 
   handleInput(data: string): void {
     if (matchesKey(data, Key.escape)) {
+      if (this.list.clearQuery()) return;
       this.opts.onCancel();
       return;
     }
-    if (matchesKey(data, Key.up)) {
-      this.selectedIndex = Math.max(0, this.selectedIndex - 1);
+
+    // ↑/↓, PgUp/PgDn, and — when searchable — typing + Backspace.
+    if (this.list.handleKey(data)) {
       return;
     }
-    if (matchesKey(data, Key.down)) {
-      this.selectedIndex = Math.max(0, Math.min(this.choices.length - 1, this.selectedIndex + 1));
+
+    // Left/Right move the active thinking effort within the model's segments.
+    if (matchesKey(data, Key.left) || matchesKey(data, Key.right)) {
+      const selected = this.selectedChoice();
+      if (selected !== undefined) {
+        const segments = segmentsFor(selected.model);
+        if (segments.length > 1) {
+          const current = this.effectiveEffort(selected);
+          const idx = segments.indexOf(current);
+          // The two-segment case is the legacy boolean On/Off control: both
+          // arrows flip it. With more segments (efforts), ←/→ step.
+          let next: number;
+          if (segments.length === 2) {
+            next = idx === 0 ? 1 : 0;
+          } else {
+            const delta = matchesKey(data, Key.left) ? -1 : 1;
+            next = Math.max(0, Math.min(segments.length - 1, idx + delta));
+          }
+          if (next !== idx) {
+            this.thinkingOverrides.set(selected.alias, segments[next]!);
+          }
+        }
+      }
       return;
     }
-    const selected = this.selectedChoice();
-    if (selected !== undefined && thinkingAvailability(selected.model) === 'toggle') {
-      if (matchesKey(data, Key.left)) {
-        this.thinkingDraft = true;
-        return;
-      }
-      if (matchesKey(data, Key.right)) {
-        this.thinkingDraft = false;
-        return;
-      }
-    }
+
     if (matchesKey(data, Key.enter)) {
+      const selected = this.selectedChoice();
       if (selected === undefined) return;
       this.opts.onSelect({
         alias: selected.alias,
-        thinking: effectiveThinking(selected.model, this.thinkingDraft),
+        thinking: commitEffort(selected, this.effectiveEffort(selected)),
+      });
+      return;
+    }
+
+    if (matchesKey(data, Key.alt('s')) && this.opts.onSessionOnlySelect !== undefined) {
+      const selected = this.selectedChoice();
+      if (selected === undefined) return;
+      this.opts.onSessionOnlySelect({
+        alias: selected.alias,
+        thinking: commitEffort(selected, this.effectiveEffort(selected)),
       });
     }
   }
 
   override render(width: number): string[] {
-    const { colors } = this.opts;
-    const lines: string[] = [
-      chalk.hex(colors.primary)('─'.repeat(width)),
-      chalk.hex(colors.primary).bold(' Select a model'),
-      chalk.hex(colors.textMuted)(' ↑↓ model · ←→ thinking · Enter apply · Esc cancel'),
-      '',
-    ];
+    const searchable = this.opts.searchable === true;
+    const view = this.list.view();
+    const totalCount = Object.keys(this.opts.models).length;
 
-    for (let i = 0; i < this.choices.length; i++) {
-      const choice = this.choices[i]!;
-      const isSelected = i === this.selectedIndex;
-      const isCurrent = choice.alias === this.opts.currentValue;
-      const pointer = isSelected ? '❯' : ' ';
-      const labelStyle = isSelected ? chalk.hex(colors.primary).bold : chalk.hex(colors.text);
-      let line = chalk.hex(isSelected ? colors.primary : colors.textDim)(`  ${pointer} `);
-      line += labelStyle(choice.label);
-      if (isCurrent) {
-        line += ' ' + chalk.hex(colors.success)('← current');
+    const titleSuffix =
+      searchable && view.query.length === 0
+        ? currentTheme.fg('textMuted', '  (type to search)')
+        : '';
+
+    // "type to search" already lives in the title suffix, so the hint only
+    // surfaces the backspace shortcut once a query is active.
+    const hintParts: string[] = [];
+    if (this.opts.providerSwitchHint) hintParts.push('Tab toggle provider');
+    hintParts.push('↑↓ navigate');
+    if (searchable && view.query.length > 0) hintParts.push('Backspace clear');
+    hintParts.push('Enter select');
+    if (this.opts.onSessionOnlySelect !== undefined) hintParts.push('Alt+S session-only');
+    hintParts.push('Esc cancel');
+
+    const lines: string[] = [
+      currentTheme.fg('primary', '─'.repeat(width)),
+      currentTheme.boldFg('primary', ' Select a model') + titleSuffix,
+      currentTheme.fg('textMuted', ' ' + hintParts.join(' · ')),
+    ];
+    if (this.opts.warning !== undefined) {
+      for (const line of wrapTextWithAnsi(this.opts.warning, Math.max(1, width - 1))) {
+        lines.push(currentTheme.fg('warning', ` ${line}`));
       }
-      lines.push(line);
+    }
+    lines.push('');
+
+    if (searchable && view.query.length > 0) {
+      lines.push(currentTheme.fg('primary', ' Search: ') + currentTheme.fg('text', view.query));
+    }
+
+    if (view.items.length === 0) {
+      lines.push(currentTheme.fg('textMuted', '   No matches'));
+    } else {
+      // Column width for model names so the provider column lines up. Capped so
+      // the provider + "← current" marker still fit on normal terminal widths.
+      const nameCap = Math.max(8, Math.floor(width * 0.5));
+      let nameWidth = 0;
+      for (let i = view.page.start; i < view.page.end; i++) {
+        const choice = view.items[i];
+        if (choice !== undefined) nameWidth = Math.max(nameWidth, visibleWidth(choice.name));
+      }
+      nameWidth = Math.min(nameWidth, nameCap);
+
+      for (let i = view.page.start; i < view.page.end; i++) {
+        const choice = view.items[i];
+        if (choice === undefined) continue;
+        const isSelected = i === view.selectedIndex;
+        const isCurrent = choice.alias === this.opts.currentValue;
+        const pointer = isSelected ? SELECT_POINTER : ' ';
+        const truncatedName = truncateToWidth(choice.name, nameWidth, '…');
+        const namePad = ' '.repeat(Math.max(0, nameWidth - visibleWidth(truncatedName)));
+        let line = currentTheme.fg(isSelected ? 'primary' : 'textDim', `  ${pointer} `);
+        line += (isSelected ? currentTheme.boldFg('primary', truncatedName) : currentTheme.fg('text', truncatedName)) + namePad;
+        line += '  ' + currentTheme.fg('textMuted', choice.provider);
+        if (isCurrent) {
+          line += ' ' + currentTheme.fg('success', CURRENT_MARK);
+        }
+        lines.push(line);
+      }
+    }
+
+    // Scroll / match indicator.
+    if (view.query.length > 0) {
+      lines.push('');
+      lines.push(
+        currentTheme.fg('textMuted', ` ${String(view.items.length)} / ${String(totalCount)}`),
+      );
+    } else {
+      const below = view.items.length - view.page.end;
+      if (below > 0) {
+        lines.push('');
+        lines.push(currentTheme.fg('textMuted', ` ▼ ${String(below)} more`));
+      }
     }
 
     lines.push('');
-    lines.push(chalk.hex(colors.textMuted)(' Thinking'));
     const selected = this.selectedChoice();
     if (selected !== undefined) {
-      lines.push(this.renderThinkingControl(selected.model));
+      const canSwitch = segmentsFor(selected.model).length > 1;
+      const thinkingHeader = canSwitch ? ' Thinking  (←→ to switch)' : ' Thinking';
+      lines.push(currentTheme.fg('textMuted', thinkingHeader));
+      lines.push(this.renderThinkingControl(selected));
     }
     lines.push('');
-    lines.push(chalk.hex(colors.primary)('─'.repeat(width)));
+    lines.push(currentTheme.fg('primary', '─'.repeat(width)));
     return lines.map((line) => truncateToWidth(line, width));
   }
 
   private selectedChoice(): ModelChoice | undefined {
-    return this.choices[this.selectedIndex];
+    return this.list.selected();
   }
 
-  private renderThinkingControl(model: ModelAlias): string {
-    const { colors } = this.opts;
+  private renderThinkingControl(choice: ModelChoice): string {
     const segment = (label: string, active: boolean): string =>
       active
-        ? chalk.hex(colors.primary).bold(`[ ${label} ]`)
-        : chalk.hex(colors.text)(`  ${label}  `);
+        ? currentTheme.boldFg('primary', `[ ${label} ]`)
+        : currentTheme.fg('text', `  ${label}  `);
+    // The whole segment is muted, suffix included, so the disabled side reads
+    // as a single greyed-out control rather than a selectable option.
+    const unavailable = (label: string): string =>
+      currentTheme.fg('textMuted', `  ${label} (Unsupported)  `);
 
-    const availability = thinkingAvailability(model);
-    if (availability === 'always-on') {
-      return `  ${segment('Always on', true)}`;
+    // Non-effort always-on / unsupported models keep the original On/Off layout
+    // so the control never shifts while moving across legacy models.
+    const efforts = effortsOf(choice.model);
+    const availability = thinkingAvailability(choice.model);
+    if (efforts.length === 0 && availability === 'always-on') {
+      return `  ${segment('On', true)} ${unavailable('Off')}`;
     }
-    if (availability === 'unsupported') {
-      return `  ${segment('Off', true)} ${chalk.hex(colors.textMuted)('unsupported')}`;
+    if (efforts.length === 0 && availability === 'unsupported') {
+      return `  ${unavailable('On')} ${segment('Off', true)}`;
     }
-    return `  ${segment('On', this.thinkingDraft)}  ${segment('Off', !this.thinkingDraft)}`;
+
+    const segments = segmentsFor(choice.model);
+    const active = this.effectiveEffort(choice);
+    const rendered = segments.map((effort) => segment(effortLabel(effort), effort === active));
+    return `  ${rendered.join('  ')}`;
   }
 }

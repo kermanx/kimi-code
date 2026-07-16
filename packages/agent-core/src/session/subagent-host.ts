@@ -1,17 +1,82 @@
-import type { TokenUsage } from '@moonshot-ai/kosong';
+import {
+  APIProviderRateLimitError,
+  isProviderRateLimitError,
+  type TokenUsage,
+} from '@moonshot-ai/kosong';
 
 import type { Agent } from '../agent';
 import type { PromptOrigin } from '../agent/context';
-import type { LoopTurnStopReason } from '../loop';
+import { ErrorCodes } from '../errors';
+import { DenyAllPermissionPolicy } from '../agent/permission/policies/deny-all';
+import { InMemoryAgentRecordPersistence } from '../agent/records';
+import { isAbortError } from '../loop/errors';
 import {
   DEFAULT_AGENT_PROFILES,
   prepareSystemPromptContext,
   type ResolvedAgentProfile,
 } from '../profile';
-import { linkAbortSignal } from '../utils/abort';
+import {
+  linkAbortSignal,
+  userCancellationReason,
+} from '../utils/abort';
 import { collectGitContext } from './git-context';
 import type { Session } from './index';
-import SUMMARY_CONTINUATION_PROMPT from './summary-continuation.md';
+import {
+  SubagentBatch,
+  resolveSwarmMaxConcurrency,
+  type SubagentResult,
+  type SubagentSuspendedEvent,
+  type QueuedSubagentTask,
+} from './subagent-batch';
+import SUMMARY_CONTINUATION_PROMPT from './summary-continuation.md?raw';
+
+export const DEFAULT_SUBAGENT_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+export const DEFAULT_SUBAGENT_TIMEOUT_DESCRIPTION = '2 hours';
+
+const SUBAGENT_TIMEOUT_ENV = 'KIMI_SUBAGENT_TIMEOUT_MS';
+
+/**
+ * Resolve the effective subagent per-task timeout. Precedence:
+ * `KIMI_SUBAGENT_TIMEOUT_MS` (integer ms) → `configMs` →
+ * `DEFAULT_SUBAGENT_TIMEOUT_MS` (2 hours). `0` means no timeout: the value
+ * feeds the background-task manager's per-task timeout (where `0` arms no
+ * timer), so it governs foreground and background subagents (and AgentSwarm).
+ */
+export function resolveSubagentTimeoutMs(configMs?: number): number {
+  const raw = process.env[SUBAGENT_TIMEOUT_ENV];
+  if (raw !== undefined && raw.trim().length > 0) {
+    const parsed = Number(raw);
+    if (Number.isInteger(parsed) && parsed >= 0) return parsed;
+  }
+  if (configMs !== undefined && Number.isInteger(configMs) && configMs >= 0) {
+    return configMs;
+  }
+  return DEFAULT_SUBAGENT_TIMEOUT_MS;
+}
+
+/** Human-readable duration for the subagent timeout message. */
+export function formatSubagentTimeoutDescription(ms: number): string {
+  if (ms % (60 * 60 * 1000) === 0) {
+    const h = ms / (60 * 60 * 1000);
+    return `${h} hour${h === 1 ? '' : 's'}`;
+  }
+  if (ms % (60 * 1000) === 0) {
+    const m = ms / (60 * 1000);
+    return `${m} minute${m === 1 ? '' : 's'}`;
+  }
+  if (ms % 1000 === 0) {
+    const s = ms / 1000;
+    return `${s} second${s === 1 ? '' : 's'}`;
+  }
+  return `${ms} ms`;
+}
+
+export type {
+  SubagentResult as QueuedSubagentRunResult,
+  QueuedSubagentTask,
+  ResumeQueuedSubagentTask,
+  SpawnQueuedSubagentTask,
+} from './subagent-batch';
 
 /**
  * A subagent summary shorter than this many characters triggers one
@@ -23,25 +88,44 @@ const SUMMARY_CONTINUATION_ATTEMPTS = 1;
 const HOOK_TEXT_PREVIEW_LENGTH = 500;
 const SUBAGENT_MAX_TOKENS_ERROR =
   'Subagent turn failed before completing its final summary: reason=max_tokens';
+const TOOL_CALL_DISABLED_MESSAGE =
+  'Tool calls are disabled for side questions. Answer with text only.';
+const SUBAGENT_PROMPT_ORIGIN: PromptOrigin = { kind: 'system_trigger', name: 'subagent' };
+const SIDE_QUESTION_SYSTEM_REMINDER = `
+This is a side-channel conversation with the user. You should answer user questions directly based on what you already know.
 
-type RunSubagentOptions = {
+IMPORTANT:
+- You are a separate, lightweight instance.
+- The main agent continues independently; do not reference being interrupted.
+- Do not call any tools. All tool calls are disabled and will be rejected.
+  Even though tool definitions are visible in this request, they exist only
+  for technical reasons (prompt cache). You must not use them.
+- Respond only with text based on what you already know from the conversation
+  and this side-channel conversation.
+- Follow-up turns may happen in this side-channel conversation.
+- If you do not know the answer, say so directly.
+`;
+
+export interface RunSubagentOptions {
   readonly parentToolCallId: string;
-  readonly parentToolCallUuid?: string | undefined;
+  readonly parentToolCallUuid?: string;
   readonly prompt: string;
   readonly description: string;
+  readonly swarmIndex?: number;
   readonly runInBackground: boolean;
-  readonly origin?: PromptOrigin | undefined;
   readonly signal: AbortSignal;
-};
+  readonly onReady?: () => void;
+  readonly suppressRateLimitFailureEvent?: boolean;
+}
+
+export interface SpawnSubagentOptions extends RunSubagentOptions {
+  readonly profileName: string;
+  readonly swarmItem?: string;
+}
 
 type SubagentCompletion = {
   readonly result: string;
   readonly usage?: TokenUsage;
-};
-
-type ActiveChild = {
-  readonly controller: AbortController;
-  readonly runInBackground: boolean;
 };
 
 export type SubagentHandle = {
@@ -52,50 +136,38 @@ export type SubagentHandle = {
 };
 
 export class SessionSubagentHost {
-  private readonly activeChildren = new Map<string, ActiveChild>();
+  private readonly activeChildren = new Map<
+    string,
+    {
+      readonly controller: AbortController;
+      runInBackground: boolean;
+    }
+  >();
 
   constructor(
     private readonly session: Session,
     private readonly ownerAgentId: string,
-    readonly backgroundTaskTimeoutMs?: number | undefined,
   ) {}
 
-  async spawn(profileName: string, options: RunSubagentOptions): Promise<SubagentHandle> {
+  async spawn(options: SpawnSubagentOptions): Promise<SubagentHandle> {
     options.signal.throwIfAborted();
 
-    const parent = this.session.agents.get(this.ownerAgentId);
-    if (parent === undefined) {
-      throw new Error(`Parent agent "${this.ownerAgentId}" was not found`);
-    }
-
-    const profile = this.resolveProfile(parent, profileName);
+    const parent = await this.session.ensureAgentResumed(this.ownerAgentId);
+    const profile = this.resolveProfile(parent, options.profileName);
     const { id, agent } = await this.session.createAgent(
       { type: 'sub', generate: parent.rawGenerate },
-      undefined,
-      this.ownerAgentId,
+      { parentAgentId: this.ownerAgentId, swarmItem: options.swarmItem },
     );
-    const controller = new AbortController();
-    const unlinkAbortSignal = linkAbortSignal(options.signal, controller);
-    this.activeChildren.set(id, {
-      controller,
-      runInBackground: options.runInBackground,
+    const completion = this.runWithActiveChild(id, options, async (runOptions) => {
+      this.emitSubagentSpawned(parent, id, profile.name, runOptions);
+      try {
+        await this.configureChild(parent, agent, profile);
+        return await this.runPromptTurn(parent, id, agent, profile.name, runOptions);
+      } catch (error) {
+        this.emitSubagentFailed(parent, id, runOptions, error);
+        throw error;
+      }
     });
-
-    const completion = this.runChild(
-      parent,
-      id,
-      agent,
-      profile.name,
-      {
-        ...options,
-        signal: controller.signal,
-      },
-      () => this.configureChild(parent, agent, profile),
-    ).finally(() => {
-      unlinkAbortSignal();
-      this.activeChildren.delete(id);
-    });
-
     return {
       agentId: id,
       profileName: profile.name,
@@ -106,16 +178,46 @@ export class SessionSubagentHost {
 
   async resume(agentId: string, options: RunSubagentOptions): Promise<SubagentHandle> {
     options.signal.throwIfAborted();
+    const { parent, child, profileName } = await this.ensureIdleSubagent(agentId);
+    const completion = this.runWithActiveChild(agentId, options, async (runOptions) => {
+      this.emitSubagentSpawned(parent, agentId, profileName, runOptions);
+      try {
+        child.config.update({ modelAlias: parent.config.modelAlias });
+        return await this.runPromptTurn(parent, agentId, child, profileName, runOptions);
+      } catch (error) {
+        this.emitSubagentFailed(parent, agentId, runOptions, error);
+        throw error;
+      }
+    });
+    return { agentId, profileName, resumed: true, completion };
+  }
 
-    const parent = this.session.agents.get(this.ownerAgentId);
-    if (parent === undefined) {
-      throw new Error(`Parent agent "${this.ownerAgentId}" was not found`);
-    }
+  async retry(agentId: string, options: RunSubagentOptions): Promise<SubagentHandle> {
+    options.signal.throwIfAborted();
+    const { parent, child, profileName } = await this.ensureIdleSubagent(agentId);
+    const completion = this.runWithActiveChild(agentId, options, async (runOptions) => {
+      try {
+        runOptions.signal.throwIfAborted();
+        child.config.update({ modelAlias: parent.config.modelAlias });
+        this.emitSubagentStarted(parent, agentId);
+        const turnId = child.turn.retry('agent-host');
+        if (turnId === null) {
+          throw new Error(`Agent instance "${agentId}" could not start a retry turn`);
+        }
+        this.observeFirstRequest(child, runOptions);
+        return await this.waitForChildCompletion(parent, agentId, child, profileName, runOptions);
+      } catch (error) {
+        this.emitSubagentFailed(parent, agentId, runOptions, error);
+        throw error;
+      }
+    });
+    return { agentId, profileName, resumed: true, completion };
+  }
 
-    const child = this.session.agents.get(agentId);
-    if (child === undefined) {
-      throw new Error(`Agent instance "${agentId}" was not found`);
-    }
+  private async ensureIdleSubagent(
+    agentId: string,
+  ): Promise<{ readonly parent: Agent; readonly child: Agent; readonly profileName: string }> {
+    const parent = await this.session.ensureAgentResumed(this.ownerAgentId);
     const metadata = this.session.metadata.agents[agentId];
     if (metadata?.type !== 'sub') {
       throw new Error(`Agent instance "${agentId}" is not a subagent`);
@@ -123,66 +225,86 @@ export class SessionSubagentHost {
     if (metadata.parentAgentId !== this.ownerAgentId) {
       throw new Error(`Agent instance "${agentId}" does not belong to this parent agent`);
     }
+    const child = await this.session.ensureAgentResumed(agentId);
     if (this.activeChildren.has(agentId) || child.turn.hasActiveTurn) {
-      throw new Error(
-        `Agent instance "${agentId}" is already running and cannot be resumed concurrently`,
-      );
+      throw new Error(`Agent instance "${agentId}" is already running and cannot run concurrently`);
     }
 
     const profileName = child.config.profileName ?? 'subagent';
-
-    const controller = new AbortController();
-    const unlinkAbortSignal = linkAbortSignal(options.signal, controller);
-    this.activeChildren.set(agentId, {
-      controller,
-      runInBackground: options.runInBackground,
-    });
-
-    const completion = this.runChild(
-      parent,
-      agentId,
-      child,
-      profileName,
-      {
-        ...options,
-        signal: controller.signal,
-      },
-      // A resumed subagent is realigned to the parent agent's current model,
-      // so a parent setModel between the initial spawn and the resume is
-      // reflected — a subagent always uses the parent agent's model.
-      () => {
-        child.config.update({ modelAlias: parent.config.modelAlias });
-        return Promise.resolve();
-      },
-    ).finally(() => {
-      unlinkAbortSignal();
-      this.activeChildren.delete(agentId);
-    });
-
-    return {
-      agentId,
-      profileName,
-      resumed: true,
-      completion,
-    };
+    return { parent, child, profileName };
   }
 
-  cancelAll(): void {
+  async runQueued<T>(tasks: readonly QueuedSubagentTask<T>[]): Promise<Array<SubagentResult<T>>> {
+    const maxConcurrency = resolveSwarmMaxConcurrency();
+    return new SubagentBatch(this, tasks, { maxConcurrency }).run();
+  }
+
+  suspended(event: SubagentSuspendedEvent): void {
+    const parent = this.session.getReadyAgent?.(this.ownerAgentId);
+    parent?.emitEvent({
+      type: 'subagent.suspended',
+      subagentId: event.agentId,
+      reason: event.reason,
+    });
+  }
+
+  async startBtw(): Promise<string> {
+    const parent = await this.session.ensureAgentResumed(this.ownerAgentId);
+    const { id, agent: child } = await this.session.createAgent(
+      {
+        type: 'sub',
+        generate: parent.rawGenerate,
+        persistence: new InMemoryAgentRecordPersistence(),
+      },
+      { parentAgentId: this.ownerAgentId, persistMetadata: false },
+    );
+
+    child.config.update({
+      modelAlias: parent.config.modelAlias,
+      thinkingEffort: parent.config.thinkingEffort,
+      systemPrompt: parent.config.systemPrompt,
+    });
+    child.tools.copyLoopToolsFrom(parent.tools);
+    child.context.useProjectedHistoryFrom(parent.context);
+    child.context.appendSystemReminder(SIDE_QUESTION_SYSTEM_REMINDER.trim(), {
+      kind: 'system_trigger',
+      name: 'btw',
+    });
+    child.permission.policies.unshift(new DenyAllPermissionPolicy(TOOL_CALL_DISABLED_MESSAGE));
+    return id;
+  }
+
+  cancelAll(reason: unknown = userCancellationReason()): void {
     const foregroundChildren = Array.from(this.activeChildren).filter(
       ([, child]) => !child.runInBackground,
     );
     for (const [childId, child] of foregroundChildren) {
-      this.session.agents.get(childId)?.subagentHost?.cancelAll();
-      child.controller.abort();
+      this.session.getReadyAgent(childId)?.subagentHost?.cancelAll(reason);
+      // Abort with the cancel reason (a user interruption by default) so the
+      // subagent's in-flight tools report the cause accurately to the model.
+      child.controller.abort(reason);
     }
   }
 
-  getProfileName(agentId: string): string | undefined {
+  markActiveChildDetached(agentId: string): void {
+    const child = this.activeChildren.get(agentId);
+    if (child !== undefined) child.runInBackground = true;
+  }
+
+  async getProfileName(agentId: string): Promise<string | undefined> {
     const metadata = this.session.metadata.agents[agentId];
     if (metadata?.type !== 'sub' || metadata.parentAgentId !== this.ownerAgentId) {
       return undefined;
     }
-    return this.session.agents.get(agentId)?.config.profileName;
+    return (await this.session.ensureAgentResumed(agentId)).config.profileName;
+  }
+
+  getSwarmItem(agentId: string): string | undefined {
+    const metadata = this.session.metadata.agents[agentId];
+    if (metadata?.type !== 'sub' || metadata.parentAgentId !== this.ownerAgentId) {
+      return undefined;
+    }
+    return metadata.swarmItem;
   }
 
   private resolveProfile(parent: Agent, profileName: string): ResolvedAgentProfile {
@@ -195,79 +317,82 @@ export class SessionSubagentHost {
     return profile;
   }
 
-  private async runChild(
+  private runWithActiveChild(
+    childId: string,
+    options: RunSubagentOptions,
+    run: (options: RunSubagentOptions) => Promise<SubagentCompletion>,
+  ): Promise<SubagentCompletion> {
+    const controller = new AbortController();
+    const unlinkAbortSignal = linkAbortSignal(options.signal, controller);
+    this.activeChildren.set(childId, {
+      controller,
+      runInBackground: options.runInBackground,
+    });
+
+    return run({ ...options, signal: controller.signal }).finally(() => {
+      unlinkAbortSignal();
+      this.activeChildren.delete(childId);
+    });
+  }
+
+  private async runPromptTurn(
     parent: Agent,
     childId: string,
     child: Agent,
     profileName: string,
     options: RunSubagentOptions,
-    prepareChild: () => Promise<void>,
   ): Promise<SubagentCompletion> {
-    parent.emitEvent({
-      type: 'subagent.spawned',
-      subagentId: childId,
-      subagentName: profileName,
-      parentToolCallId: options.parentToolCallId,
-      parentToolCallUuid: options.parentToolCallUuid,
-      parentAgentId: this.ownerAgentId,
-      description: options.description,
-      runInBackground: options.runInBackground,
-    });
-    parent.telemetry.track('subagent_created', {
-      subagent_name: profileName,
-      run_in_background: options.runInBackground,
-    });
+    options.signal.throwIfAborted();
+    await this.triggerSubagentStart(parent, profileName, options.prompt, options.signal);
+    options.signal.throwIfAborted();
 
-    try {
-      await prepareChild();
-      options.signal.throwIfAborted();
-      await this.triggerSubagentStart(parent, profileName, options.prompt, options.signal);
-      options.signal.throwIfAborted();
-
-      // Explore subagents start cold; a git-context block helps them orient
-      // in the repository before searching.
-      let childPrompt = options.prompt;
-      if (profileName === 'explore') {
-        const gitContext = await collectGitContext(child.runtime.kaos, child.config.cwd);
-        if (gitContext) childPrompt = `${gitContext}\n\n${childPrompt}`;
-      }
-      const origin: PromptOrigin = options.origin ?? { kind: 'system_trigger', name: 'subagent' };
-      child.turn.prompt([{ type: 'text', text: childPrompt }], origin);
-      await runChildTurnToCompletion(child, options.signal);
-
-      // A subagent that returns an overly terse summary leaves the parent
-      // agent under-informed. Give it a bounded number of chances to expand
-      // the handoff; if it is still short after that, accept it as-is rather
-      // than retrying indefinitely.
-      let result = lastAssistantText(child);
-      let remainingContinuations = SUMMARY_CONTINUATION_ATTEMPTS;
-      while (remainingContinuations > 0 && result.length < SUMMARY_MIN_LENGTH) {
-        remainingContinuations -= 1;
-        options.signal.throwIfAborted();
-        child.turn.prompt([{ type: 'text', text: SUMMARY_CONTINUATION_PROMPT }], origin);
-        await runChildTurnToCompletion(child, options.signal);
-        result = lastAssistantText(child);
-      }
-      const usage = child.usage.data().total;
-      parent.emitEvent({
-        type: 'subagent.completed',
-        subagentId: childId,
-        parentToolCallId: options.parentToolCallId,
-        resultSummary: result,
-        usage,
-      });
-      this.triggerSubagentStop(parent, profileName, result);
-      return { result, usage };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      parent.emitEvent({
-        type: 'subagent.failed',
-        subagentId: childId,
-        parentToolCallId: options.parentToolCallId,
-        error: message,
-      });
-      throw error;
+    let childPrompt = options.prompt;
+    if (profileName === 'explore') {
+      const gitContext = await collectGitContext(child.kaos, child.config.cwd);
+      if (gitContext) childPrompt = `${gitContext}\n\n${childPrompt}`;
     }
+
+    this.emitSubagentStarted(parent, childId);
+    const turnId = child.turn.prompt([{ type: 'text', text: childPrompt }], SUBAGENT_PROMPT_ORIGIN);
+    if (turnId === null) {
+      throw new Error(`Agent instance "${childId}" could not start a turn`);
+    }
+    this.observeFirstRequest(child, options);
+    return this.waitForChildCompletion(parent, childId, child, profileName, options);
+  }
+
+  private async waitForChildCompletion(
+    parent: Agent,
+    childId: string,
+    child: Agent,
+    profileName: string,
+    options: RunSubagentOptions,
+  ): Promise<SubagentCompletion> {
+    await runChildTurnToCompletion(child, options.signal);
+
+    // A subagent that returns an overly terse summary leaves the parent
+    // agent under-informed. Give it a bounded number of chances to expand
+    // the handoff; if it is still short after that, accept it as-is rather
+    // than retrying indefinitely.
+    let result = lastAssistantText(child);
+    let remainingContinuations = SUMMARY_CONTINUATION_ATTEMPTS;
+    while (remainingContinuations > 0 && result.length < SUMMARY_MIN_LENGTH) {
+      remainingContinuations -= 1;
+      options.signal.throwIfAborted();
+      child.turn.prompt([{ type: 'text', text: SUMMARY_CONTINUATION_PROMPT }], SUBAGENT_PROMPT_ORIGIN);
+      await runChildTurnToCompletion(child, options.signal);
+      result = lastAssistantText(child);
+    }
+    const usage = child.usage.data().total;
+    parent.emitEvent({
+      type: 'subagent.completed',
+      subagentId: childId,
+      resultSummary: result,
+      usage,
+      contextTokens: child.context.tokenCount,
+    });
+    this.triggerSubagentStop(parent, profileName, result);
+    return { result, usage };
   }
 
   private async configureChild(
@@ -279,11 +404,16 @@ export class SessionSubagentHost {
     child.config.update({
       cwd: parent.config.cwd,
       modelAlias: parent.config.modelAlias,
-      thinkingLevel: parent.config.thinkingLevel,
+      thinkingEffort: parent.config.thinkingEffort,
     });
 
-    const context = await prepareSystemPromptContext(child.runtime.kaos, child.config.cwd);
-    child.useProfile(profile, context);
+    const context = await prepareSystemPromptContext(
+      this.session.systemContextKaos(child.kaos.getcwd()),
+      this.session.options.kimiHomeDir,
+      { additionalDirs: child.getAdditionalDirs() },
+    );
+    child.useProfile(profile, context, this.session.options.kimiHomeDir);
+    child.tools.inheritUserTools(parent.tools);
   }
 
   private async triggerSubagentStart(
@@ -311,25 +441,96 @@ export class SessionSubagentHost {
       },
     });
   }
+
+  private observeFirstRequest(
+    child: Agent,
+    options: RunSubagentOptions,
+  ): void {
+    if (options.onReady === undefined) return;
+    void child.turn
+      .waitForTurnFirstRequest()
+      .then(() => {
+        options.onReady?.();
+      })
+      .catch(() => {});
+  }
+
+  private emitSubagentSpawned(
+    parent: Agent,
+    childId: string,
+    profileName: string,
+    options: RunSubagentOptions,
+  ): void {
+    parent.emitEvent({
+      type: 'subagent.spawned',
+      subagentId: childId,
+      subagentName: profileName,
+      parentToolCallId: options.parentToolCallId,
+      parentToolCallUuid: options.parentToolCallUuid,
+      parentAgentId: this.ownerAgentId,
+      description: options.description,
+      swarmIndex: options.swarmIndex,
+      runInBackground: options.runInBackground,
+    });
+    parent.telemetry.track('subagent_created', {
+      subagent_name: profileName,
+      run_in_background: options.runInBackground,
+    });
+  }
+
+  private emitSubagentStarted(
+    parent: Agent,
+    childId: string,
+  ): void {
+    parent.emitEvent({
+      type: 'subagent.started',
+      subagentId: childId,
+    });
+  }
+
+  private emitSubagentFailed(
+    parent: Agent,
+    childId: string,
+    options: RunSubagentOptions,
+    error: unknown,
+  ): void {
+    if (shouldSuppressQueuedAttemptFailureEvent(options, error)) return;
+    parent.emitEvent({
+      type: 'subagent.failed',
+      subagentId: childId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 async function runChildTurnToCompletion(child: Agent, signal: AbortSignal): Promise<void> {
   const completion = await child.turn.waitForCurrentTurn(signal);
   const turnEnded = completion.event;
   if (turnEnded.reason !== 'completed') {
+    if (turnEnded.error?.code === ErrorCodes.PROVIDER_FILTERED) {
+      throw new Error('Subagent turn blocked by provider safety policy');
+    }
+    if (turnEnded.error?.code === ErrorCodes.PROVIDER_RATE_LIMIT) {
+      throw providerRateLimitErrorFromPayload(turnEnded.error);
+    }
     throw new Error(
       turnEnded.error === undefined
         ? `Subagent turn ${turnEnded.reason}`
         : `[${turnEnded.error.code}] ${turnEnded.error.message}`,
     );
   }
-  throwIfSubagentStoppedAtMaxTokens(completion.stopReason);
-}
-
-function throwIfSubagentStoppedAtMaxTokens(stopReason: LoopTurnStopReason | undefined): void {
-  if (stopReason === 'max_tokens') {
+  if (completion.stopReason === 'max_tokens') {
     throw new Error(`${SUBAGENT_MAX_TOKENS_ERROR}.`);
   }
+}
+
+function providerRateLimitErrorFromPayload(error: {
+  readonly message: string;
+  readonly details?: Record<string, unknown>;
+}): APIProviderRateLimitError {
+  const requestId =
+    typeof error.details?.['requestId'] === 'string' ? error.details['requestId'] : null;
+  return new APIProviderRateLimitError(error.message, requestId);
 }
 
 function lastAssistantText(agent: Agent): string {
@@ -342,4 +543,13 @@ function lastAssistantText(agent: Agent): string {
     if (text.trim().length > 0) return text.trim();
   }
   return '';
+}
+
+function shouldSuppressQueuedAttemptFailureEvent(
+  options: RunSubagentOptions,
+  error: unknown,
+): boolean {
+  if (options.suppressRateLimitFailureEvent !== true) return false;
+  if (isProviderRateLimitError(error)) return true;
+  return isAbortError(error) || options.signal.aborted;
 }

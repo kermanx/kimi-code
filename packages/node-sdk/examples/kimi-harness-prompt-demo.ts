@@ -1,4 +1,4 @@
-import { KimiHarness, type Session, type Event } from '@moonshot-ai/kimi-code-sdk';
+import { createKimiHarness, type Event, type Session } from '@moonshot-ai/kimi-code-sdk';
 
 import { smokeIdentityFromEnv } from './runtime-smoke-helpers';
 
@@ -8,7 +8,7 @@ const PROMPT =
 
 async function main(): Promise<void> {
   const workDir = process.cwd();
-  const harness = new KimiHarness({ identity: smokeIdentityFromEnv() });
+  const harness = createKimiHarness({ identity: smokeIdentityFromEnv() });
 
   try {
     const config = await harness.getConfig();
@@ -99,6 +99,8 @@ function handleEvent(
       process.stderr.write(`\nerror: ${event.code}: ${event.message}\n`);
       break;
     case 'agent.status.updated':
+    case 'cron.fired':
+    case 'goal.updated':
     case 'session.meta.updated':
     case 'skill.activated':
     case 'turn.step.started':
@@ -112,15 +114,17 @@ function handleEvent(
     case 'tool.list.updated':
     case 'mcp.server.status':
     case 'subagent.spawned':
+    case 'subagent.started':
     case 'subagent.completed':
     case 'subagent.failed':
+    case 'subagent.suspended':
     case 'compaction.started':
     case 'compaction.blocked':
     case 'compaction.cancelled':
     case 'compaction.completed':
     case 'background.task.started':
-    case 'background.task.updated':
     case 'background.task.terminated':
+    case 'warning':
       break;
   }
 }

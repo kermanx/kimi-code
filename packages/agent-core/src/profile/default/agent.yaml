@@ -15,20 +15,28 @@ tools:
   - TaskList
   - TaskOutput
   - TaskStop
+  - CronCreate
+  - CronList
+  - CronDelete
   - ReadMediaFile
   - TodoList
   - Skill
   - WebSearch
   - Agent
+  - AgentSwarm
   - FetchURL
   - AskUserQuestion
   - EnterPlanMode
   - ExitPlanMode
+  - CreateGoal
+  - GetGoal
+  - SetGoalBudget
+  - UpdateGoal
   - mcp__*
 
 subagents:
   coder:
-    description: Good at general software engineering tasks.
+    description: General software engineering agent — the only subagent type with file-editing tools; use it for any delegated task that must modify code.
   explore:
     description: Fast codebase exploration with prompt-enforced read-only behavior.
   plan:

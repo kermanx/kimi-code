@@ -11,8 +11,8 @@
  * their own `WorkspaceConfig` with narrower bounds.
  */
 
+import type { Environment, Kaos } from '@moonshot-ai/kaos';
 import type { ExecutableToolResult } from '#/loop';
-import type { Kaos } from '@moonshot-ai/kaos';
 
 import type { WorkspaceConfig } from '../../../src/tools/support/workspace';
 
@@ -20,14 +20,35 @@ function notImplemented(method: string): never {
   throw new Error(`FakeKaos.${method} not implemented — override in test`);
 }
 
-export function createFakeKaos(overrides?: Partial<Kaos>): Kaos {
+export const FAKE_OS_ENV: Environment = {
+  osKind: 'Linux',
+  osArch: 'x86_64',
+  osVersion: 'test',
+  shellName: 'bash',
+  shellPath: '/bin/bash',
+};
+
+export function createFakeKaos(
+  overrides?: Partial<Kaos>,
+  envLayers: readonly Record<string, string>[] = [],
+): Kaos {
+  // Hold cwd in a closure so tests that call `chdir` directly can mutate it
+  // and later `getcwd()` calls see the update — mirroring real-kaos semantics
+  // without needing a backing fs.
+  let cwd = overrides?.getcwd?.() ?? '/workspace';
   const base: Kaos = {
     name: 'fake',
+    osEnv: FAKE_OS_ENV,
     pathClass: () => 'posix',
     normpath: (p: string) => p,
     gethome: () => '/home/test',
-    getcwd: () => '/workspace',
-    chdir: () => notImplemented('chdir'),
+    getcwd: () => cwd,
+    withCwd: (next: string) => createFakeKaos({ ...overrides, getcwd: () => next }, envLayers),
+    withEnv: (env: Record<string, string>) =>
+      createFakeKaos({ ...overrides, getcwd: () => cwd }, [...envLayers, env]),
+    chdir: async (next: string) => {
+      cwd = next;
+    },
     stat: () => notImplemented('stat'),
     iterdir: () => notImplemented('iterdir'),
     glob: () => notImplemented('glob'),
@@ -38,9 +59,31 @@ export function createFakeKaos(overrides?: Partial<Kaos>): Kaos {
     writeText: () => notImplemented('writeText'),
     mkdir: () => notImplemented('mkdir'),
     exec: () => notImplemented('exec'),
-    execWithEnv: () => notImplemented('execWithEnv'),
+    execWithEnv: (args, invocationEnv) => {
+      const mergedEnv = mergeEnvLayers(invocationEnv, envLayers);
+      if (overrides?.execWithEnv) return overrides.execWithEnv(args, mergedEnv);
+      return notImplemented('execWithEnv');
+    },
   };
-  return { ...base, ...overrides } as Kaos;
+  return {
+    ...base,
+    ...overrides,
+    execWithEnv: base.execWithEnv,
+    withCwd: base.withCwd,
+    withEnv: base.withEnv,
+  } as Kaos;
+}
+
+function mergeEnvLayers(
+  invocationEnv: Record<string, string> | undefined,
+  envLayers: readonly Record<string, string>[],
+): Record<string, string> | undefined {
+  if (envLayers.length === 0) return invocationEnv;
+  const merged: Record<string, string> = { ...invocationEnv };
+  for (const layer of envLayers) {
+    Object.assign(merged, layer);
+  }
+  return merged;
 }
 
 export const PERMISSIVE_WORKSPACE: WorkspaceConfig = {

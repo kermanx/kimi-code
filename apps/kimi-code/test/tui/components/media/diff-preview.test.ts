@@ -5,9 +5,6 @@ import {
   renderDiffLines,
   renderDiffLinesClustered,
 } from '#/tui/components/media/diff-preview';
-import { getColorPalette } from '#/tui/theme/colors';
-
-const COLORS = getColorPalette('dark');
 
 function stripAnsi(text: string): string {
   return text.replaceAll(/\u001B\[[0-9;]*m/g, '');
@@ -46,7 +43,7 @@ describe('computeDiffLines', () => {
 
 describe('renderDiffLines', () => {
   it('does not show removed count for suppressed trailing deletes', () => {
-    const output = renderDiffLines('A\nB\nC\nD', 'A\nB', 'test.ts', COLORS, true, 1, 1);
+    const output = renderDiffLines('A\nB\nC\nD', 'A\nB', 'test.ts', true, 1, 1);
     const text = stripAnsi(output.join('\n'));
     expect(text).toContain('test.ts');
     expect(text).not.toContain('-2');
@@ -59,7 +56,7 @@ describe('renderDiffLines', () => {
   });
 
   it('shows removed count for complete diffs', () => {
-    const output = renderDiffLines('A\nB\nC\nD', 'A\nB', 'test.ts', COLORS, false, 1, 1);
+    const output = renderDiffLines('A\nB\nC\nD', 'A\nB', 'test.ts', false, 1, 1);
     const text = stripAnsi(output.join('\n'));
     expect(text).toContain('-2');
     expect(text).toContain('C');
@@ -69,7 +66,7 @@ describe('renderDiffLines', () => {
 
 describe('renderDiffLinesClustered', () => {
   it('renders header with file path and counts', () => {
-    const out = renderDiffLinesClustered('A\nB\nC', 'A\nX\nC', 'foo.ts', COLORS);
+    const out = renderDiffLinesClustered('A\nB\nC', 'A\nX\nC', 'foo.ts');
     const text = stripAnsi(out[0]!);
     expect(text).toContain('+1');
     expect(text).toContain('-1');
@@ -77,7 +74,7 @@ describe('renderDiffLinesClustered', () => {
   });
 
   it('returns header only when there are no changes', () => {
-    const out = renderDiffLinesClustered('A\nB', 'A\nB', 'foo.ts', COLORS);
+    const out = renderDiffLinesClustered('A\nB', 'A\nB', 'foo.ts');
     expect(out).toHaveLength(1);
     expect(stripAnsi(out[0]!)).toContain('foo.ts');
   });
@@ -87,7 +84,7 @@ describe('renderDiffLinesClustered', () => {
     const oldText = ['L1', 'L2', 'L3', 'L4', 'L5'].join('\n');
     const newText = ['L1', 'L2', 'L3X', 'L4', 'L5'].join('\n');
     const text = stripAnsi(
-      renderDiffLinesClustered(oldText, newText, 'f.ts', COLORS, { contextLines: 1 }).join('\n'),
+      renderDiffLinesClustered(oldText, newText, 'f.ts', { contextLines: 1 }).join('\n'),
     );
     expect(text).toContain('L2');
     expect(text).toContain('L3');
@@ -104,7 +101,7 @@ describe('renderDiffLinesClustered', () => {
     newLines[1] = 'L2X'; // change near top
     newLines[28] = 'L29X'; // change near bottom
     const text = stripAnsi(
-      renderDiffLinesClustered(oldLines.join('\n'), newLines.join('\n'), 'f.ts', COLORS, {
+      renderDiffLinesClustered(oldLines.join('\n'), newLines.join('\n'), 'f.ts', {
         contextLines: 2,
       }).join('\n'),
     );
@@ -121,7 +118,7 @@ describe('renderDiffLinesClustered', () => {
     const newLines = oldLines.slice();
     newLines[2] = 'L3X';
     newLines[5] = 'L6X'; // gap of 2 lines between change indices 2 and 5 → merges with contextLines=2 (mergeGap=4)
-    const out = renderDiffLinesClustered(oldLines.join('\n'), newLines.join('\n'), 'f.ts', COLORS, {
+    const out = renderDiffLinesClustered(oldLines.join('\n'), newLines.join('\n'), 'f.ts', {
       contextLines: 2,
     }).join('\n');
     const text = stripAnsi(out);
@@ -144,7 +141,6 @@ describe('renderDiffLinesClustered', () => {
       oldLines.join('\n'),
       newLines.join('\n'),
       'big.ts',
-      COLORS,
       {
         contextLines: 3,
         maxLines: 10,
@@ -159,6 +155,22 @@ describe('renderDiffLinesClustered', () => {
     expect(text).toContain('ctrl+o to expand');
   });
 
+  it('respects oldStart and newStart for line numbers', () => {
+    const text = stripAnsi(
+      renderDiffLinesClustered('A\nB\nC', 'A\nX\nC', 'f.ts', {
+        contextLines: 1,
+        oldStart: 10,
+        newStart: 20,
+      }).join('\n'),
+    );
+    // Context lines keep the new (post-edit) line numbers from newStart;
+    // deleted lines use oldStart; added lines use newStart.
+    expect(text).toContain('  20   A');
+    expect(text).toContain('  11 - B');
+    expect(text).toContain('  21 + X');
+    expect(text).toContain('  22   C');
+  });
+
   it('truncates at cluster boundary and appends the ctrl+o footer when maxLines is set', () => {
     const oldLines: string[] = [];
     for (let i = 1; i <= 50; i++) oldLines.push(`L${String(i)}`);
@@ -167,7 +179,7 @@ describe('renderDiffLinesClustered', () => {
     newLines[20] = 'L21X';
     newLines[40] = 'L41X';
     const text = stripAnsi(
-      renderDiffLinesClustered(oldLines.join('\n'), newLines.join('\n'), 'f.ts', COLORS, {
+      renderDiffLinesClustered(oldLines.join('\n'), newLines.join('\n'), 'f.ts', {
         contextLines: 2,
         maxLines: 6,
       }).join('\n'),

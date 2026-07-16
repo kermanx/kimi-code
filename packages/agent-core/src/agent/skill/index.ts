@@ -5,8 +5,12 @@ import type { ContentPart } from '@moonshot-ai/kosong';
 
 import type { Agent } from '..';
 import { ErrorCodes, KimiError } from '#/errors';
-import { isUserActivatableSkillType, type SkillRegistry } from '../../skill';
+import { isUserActivatableSkillType } from '../../skill';
 import type { SkillActivationOrigin } from '../context';
+import { renderUserSlashSkillPrompt } from './prompt';
+import type { SkillRegistry } from './types';
+
+export type { SkillRegistry } from './types';
 
 export class SkillManager {
   constructor(
@@ -23,6 +27,21 @@ export class SkillManager {
       throw new KimiError(ErrorCodes.SKILL_TYPE_UNSUPPORTED, `Skill "${skill.name}" cannot be activated by the user`);
     }
 
+    const skillArgs = input.args ?? '';
+    const skillContent = this.registry.renderSkillPrompt(skill, skillArgs);
+    const wrapped = [
+      {
+        type: 'text' as const,
+        text: renderUserSlashSkillPrompt({
+          skillName: skill.name,
+          skillArgs,
+          skillContent,
+          skillSource: skill.source,
+          skillDir: skill.dir,
+        }),
+      },
+    ];
+
     this.recordActivation(
       {
         kind: 'skill_activation',
@@ -34,12 +53,7 @@ export class SkillManager {
         skillSource: skill.source,
         skillArgs: input.args,
       },
-      [
-        {
-          type: 'text',
-          text: this.registry.renderSkillPrompt(skill, input.args ?? ''),
-        },
-      ],
+      wrapped,
     );
   }
 

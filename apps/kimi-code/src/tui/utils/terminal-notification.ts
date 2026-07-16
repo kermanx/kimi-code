@@ -1,7 +1,7 @@
-import type { Terminal } from '@earendil-works/pi-tui';
+import type { Terminal } from '@moonshot-ai/pi-tui';
 
 import { BEL, ESC, MAX_TERMINAL_NOTIFICATION_MESSAGE_LENGTH, ST } from '#/tui/constant/terminal';
-import type { TUIState } from '#/tui/kimi-tui';
+import type { TUIState } from '#/tui/tui-state';
 
 export interface TerminalNotification {
   readonly title: string;
@@ -107,6 +107,25 @@ export function supportsOsc9Notification(env: NodeJS.ProcessEnv = process.env): 
   }
   const term = env['TERM'] ?? '';
   if (term === 'xterm-kitty' || term === 'xterm-ghostty') return true;
+  return false;
+}
+
+/**
+ * Best-effort detection of ConEmu-style OSC 9;4 progress support, driven
+ * off well-known environment variables like `supportsOsc9Notification`.
+ * The two allow-lists must stay separate: iTerm2 posts a desktop
+ * notification for ANY `OSC 9;<payload>` it receives, so sending the 9;4
+ * progress sequence there pops a "4;3" notification every keepalive tick.
+ * Terminals outside this list simply get no progress reporting, which is
+ * always safe.
+ */
+export function supportsTerminalProgress(env: NodeJS.ProcessEnv = process.env): boolean {
+  if ((env['WT_SESSION'] ?? '').length > 0) return true;
+  if (env['ConEmuANSI'] === 'ON') return true;
+  const termProgram = env['TERM_PROGRAM'] ?? '';
+  if (termProgram === 'ghostty' || termProgram === 'WezTerm') return true;
+  const term = env['TERM'] ?? '';
+  if (term === 'xterm-ghostty') return true;
   return false;
 }
 

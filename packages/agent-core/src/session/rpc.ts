@@ -1,17 +1,25 @@
 import { ErrorCodes, KimiError } from '#/errors';
+import type { SessionWarning } from '@moonshot-ai/protocol';
 import type {
   ActivateSkillPayload,
+  ActivatePluginCommandPayload,
+  AddAdditionalDirPayload,
+  AddAdditionalDirResult,
   AgentAPI,
   BeginCompactionPayload,
   CancelPayload,
   CancelPlanPayload,
+  CancelShellCommandPayload,
+  CreateGoalPayload,
+  DetachBackgroundPayload,
   EmptyPayload,
-  GetBackgroundOutputPathPayload,
+  EnterSwarmPayload,
   GetBackgroundOutputPayload,
   GetBackgroundPayload,
   McpServerInfo,
   McpStartupMetrics,
   PromptPayload,
+  RunShellCommandPayload,
   ReconnectMcpServerPayload,
   RenameSessionPayload,
   RegisterToolPayload,
@@ -21,8 +29,10 @@ import type {
   SetPermissionPayload,
   SetThinkingPayload,
   SkillSummary,
+  PluginCommandDef,
   SteerPayload,
   StopBackgroundPayload,
+  UndoHistoryPayload,
   UnregisterToolPayload,
   UpdateSessionMetadataPayload,
 } from '#/rpc';
@@ -31,6 +41,7 @@ import type { PromisableMethods } from '#/utils/types';
 import type { Session, SessionMeta } from '.';
 import {
   promptMetadataTextFromPayload,
+  promptMetadataTextFromPluginCommand,
   promptMetadataTextFromSkill,
   titleFromPromptMetadataText,
 } from './prompt-metadata';
@@ -71,6 +82,10 @@ export class SessionAPIImpl implements PromisableMethods<SessionAPI> {
     return this.session.listSkills();
   }
 
+  listPluginCommands(_payload: EmptyPayload): readonly PluginCommandDef[] {
+    return this.session.listPluginCommands();
+  }
+
   listMcpServers(_payload: EmptyPayload): readonly McpServerInfo[] {
     return this.session.mcp.list();
   }
@@ -88,128 +103,203 @@ export class SessionAPIImpl implements PromisableMethods<SessionAPI> {
     return this.session.generateAgentsMd();
   }
 
+  getSessionWarnings(_payload: EmptyPayload): Promise<readonly SessionWarning[]> {
+    return this.session.getSessionWarnings();
+  }
+
+  waitForBackgroundTasksOnPrint(_payload: EmptyPayload): Promise<void> {
+    return this.session.waitForBackgroundTasksOnPrint();
+  }
+
+  handlePrintMainTurnCompleted(_payload: EmptyPayload): Promise<'finish' | 'continue'> {
+    return this.session.handlePrintMainTurnCompleted();
+  }
+
+  addAdditionalDir(payload: AddAdditionalDirPayload): Promise<AddAdditionalDirResult> {
+    return this.session.addAdditionalDir(payload.path, payload.persist);
+  }
+
   async prompt({ agentId, ...payload }: AgentScopedPayload<PromptPayload>) {
     if (agentId === 'main') {
       await this.updatePromptMetadata(promptMetadataTextFromPayload(payload));
     }
-    return this.getAgent(agentId).prompt(payload);
+    return (await this.getAgent(agentId)).prompt(payload);
   }
 
-  steer({ agentId, ...payload }: AgentScopedPayload<SteerPayload>) {
-    return this.getAgent(agentId).steer(payload);
+  async steer({ agentId, ...payload }: AgentScopedPayload<SteerPayload>) {
+    return (await this.getAgent(agentId)).steer(payload);
   }
 
-  cancel({ agentId, ...payload }: AgentScopedPayload<CancelPayload>) {
-    return this.getAgent(agentId).cancel(payload);
+  async runShellCommand({ agentId, ...payload }: AgentScopedPayload<RunShellCommandPayload>) {
+    return (await this.getAgent(agentId)).runShellCommand(payload);
   }
 
-  setModel({ agentId, ...payload }: AgentScopedPayload<SetModelPayload>) {
-    return this.getAgent(agentId).setModel(payload);
+  async cancelShellCommand({ agentId, ...payload }: AgentScopedPayload<CancelShellCommandPayload>) {
+    return (await this.getAgent(agentId)).cancelShellCommand(payload);
   }
 
-  setThinking({ agentId, ...payload }: AgentScopedPayload<SetThinkingPayload>) {
-    return this.getAgent(agentId).setThinking(payload);
+  async cancel({ agentId, ...payload }: AgentScopedPayload<CancelPayload>) {
+    return (await this.getAgent(agentId)).cancel(payload);
   }
 
-  setPermission({ agentId, ...payload }: AgentScopedPayload<SetPermissionPayload>) {
-    return this.getAgent(agentId).setPermission(payload);
+  async undoHistory({ agentId, ...payload }: AgentScopedPayload<UndoHistoryPayload>) {
+    return (await this.getAgent(agentId)).undoHistory(payload);
   }
 
-  getModel({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
-    return this.getAgent(agentId).getModel(payload);
+  async setModel({ agentId, ...payload }: AgentScopedPayload<SetModelPayload>) {
+    return (await this.getAgent(agentId)).setModel(payload);
   }
 
-  enterPlan({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
-    return this.getAgent(agentId).enterPlan(payload);
+  async setThinking({ agentId, ...payload }: AgentScopedPayload<SetThinkingPayload>) {
+    return (await this.getAgent(agentId)).setThinking(payload);
   }
 
-  cancelPlan({ agentId, ...payload }: AgentScopedPayload<CancelPlanPayload>) {
-    return this.getAgent(agentId).cancelPlan(payload);
+  async setPermission({ agentId, ...payload }: AgentScopedPayload<SetPermissionPayload>) {
+    return (await this.getAgent(agentId)).setPermission(payload);
   }
 
-  clearPlan({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
-    return this.getAgent(agentId).clearPlan(payload);
+  async getModel({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
+    return (await this.getAgent(agentId)).getModel(payload);
   }
 
-  beginCompaction({ agentId, ...payload }: AgentScopedPayload<BeginCompactionPayload>) {
-    return this.getAgent(agentId).beginCompaction(payload);
+  async enterPlan({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
+    return (await this.getAgent(agentId)).enterPlan(payload);
   }
 
-  cancelCompaction({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
-    return this.getAgent(agentId).cancelCompaction(payload);
+  async cancelPlan({ agentId, ...payload }: AgentScopedPayload<CancelPlanPayload>) {
+    return (await this.getAgent(agentId)).cancelPlan(payload);
   }
 
-  registerTool({ agentId, ...payload }: AgentScopedPayload<RegisterToolPayload>) {
-    return this.getAgent(agentId).registerTool(payload);
+  async clearPlan({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
+    return (await this.getAgent(agentId)).clearPlan(payload);
   }
 
-  unregisterTool({ agentId, ...payload }: AgentScopedPayload<UnregisterToolPayload>) {
-    return this.getAgent(agentId).unregisterTool(payload);
+  async enterSwarm({ agentId, ...payload }: AgentScopedPayload<EnterSwarmPayload>) {
+    return (await this.getAgent(agentId)).enterSwarm(payload);
   }
 
-  setActiveTools({ agentId, ...payload }: AgentScopedPayload<SetActiveToolsPayload>) {
-    return this.getAgent(agentId).setActiveTools(payload);
+  async exitSwarm({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
+    return (await this.getAgent(agentId)).exitSwarm(payload);
   }
 
-  stopBackground({ agentId, ...payload }: AgentScopedPayload<StopBackgroundPayload>) {
-    return this.getAgent(agentId).stopBackground(payload);
+  async getSwarmMode({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
+    return (await this.getAgent(agentId)).getSwarmMode(payload);
   }
 
-  clearContext({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
-    return this.getAgent(agentId).clearContext(payload);
+  async beginCompaction({ agentId, ...payload }: AgentScopedPayload<BeginCompactionPayload>) {
+    return (await this.getAgent(agentId)).beginCompaction(payload);
+  }
+
+  async cancelCompaction({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
+    return (await this.getAgent(agentId)).cancelCompaction(payload);
+  }
+
+  async registerTool({ agentId, ...payload }: AgentScopedPayload<RegisterToolPayload>) {
+    return (await this.getAgent(agentId)).registerTool(payload);
+  }
+
+  async unregisterTool({ agentId, ...payload }: AgentScopedPayload<UnregisterToolPayload>) {
+    return (await this.getAgent(agentId)).unregisterTool(payload);
+  }
+
+  async setActiveTools({ agentId, ...payload }: AgentScopedPayload<SetActiveToolsPayload>) {
+    return (await this.getAgent(agentId)).setActiveTools(payload);
+  }
+
+  async stopBackground({ agentId, ...payload }: AgentScopedPayload<StopBackgroundPayload>) {
+    return (await this.getAgent(agentId)).stopBackground(payload);
+  }
+
+  async detachBackground({ agentId, ...payload }: AgentScopedPayload<DetachBackgroundPayload>) {
+    return (await this.getAgent(agentId)).detachBackground(payload);
+  }
+
+  async clearContext({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
+    return (await this.getAgent(agentId)).clearContext(payload);
   }
 
   async activateSkill({ agentId, ...payload }: AgentScopedPayload<ActivateSkillPayload>) {
-    await this.getAgent(agentId).activateSkill(payload);
+    await (await this.getAgent(agentId)).activateSkill(payload);
     if (agentId === 'main') {
       await this.updatePromptMetadata(promptMetadataTextFromSkill(payload));
     }
   }
 
-  getBackgroundOutput({ agentId, ...payload }: AgentScopedPayload<GetBackgroundOutputPayload>) {
-    return this.getAgent(agentId).getBackgroundOutput(payload);
-  }
-
-  getBackgroundOutputPath({
+  async activatePluginCommand({
     agentId,
     ...payload
-  }: AgentScopedPayload<GetBackgroundOutputPathPayload>) {
-    return this.getAgent(agentId).getBackgroundOutputPath(payload);
-  }
-
-  getContext({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
-    return this.getAgent(agentId).getContext(payload);
-  }
-
-  getConfig({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
-    return this.getAgent(agentId).getConfig(payload);
-  }
-
-  getPermission({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
-    return this.getAgent(agentId).getPermission(payload);
-  }
-
-  getPlan({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
-    return this.getAgent(agentId).getPlan(payload);
-  }
-
-  getUsage({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
-    return this.getAgent(agentId).getUsage(payload);
-  }
-
-  getTools({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
-    return this.getAgent(agentId).getTools(payload);
-  }
-
-  getBackground({ agentId, ...payload }: AgentScopedPayload<GetBackgroundPayload>) {
-    return this.getAgent(agentId).getBackground(payload);
-  }
-
-  private getAgent(agentId: string): PromisableMethods<AgentAPI> {
-    const agent = this.session.agents.get(agentId);
-    if (agent === undefined) {
-      throw new KimiError(ErrorCodes.AGENT_NOT_FOUND, `Agent "${agentId}" was not found`);
+  }: AgentScopedPayload<ActivatePluginCommandPayload>) {
+    await (await this.getAgent(agentId)).activatePluginCommand(payload);
+    if (agentId === 'main') {
+      await this.updatePromptMetadata(promptMetadataTextFromPluginCommand(payload));
     }
+  }
+
+  async startBtw({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>): Promise<string> {
+    return (await this.getAgent(agentId)).startBtw(payload);
+  }
+
+  async createGoal({ agentId, ...payload }: AgentScopedPayload<CreateGoalPayload>) {
+    return (await this.getAgent(agentId)).createGoal(payload);
+  }
+
+  async getGoal({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
+    return (await this.getAgent(agentId)).getGoal(payload);
+  }
+
+  async pauseGoal({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
+    return (await this.getAgent(agentId)).pauseGoal(payload);
+  }
+
+  async resumeGoal({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
+    return (await this.getAgent(agentId)).resumeGoal(payload);
+  }
+
+  async cancelGoal({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
+    return (await this.getAgent(agentId)).cancelGoal(payload);
+  }
+
+  async getCronTasks({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
+    return (await this.getAgent(agentId)).getCronTasks(payload);
+  }
+
+  async getBackgroundOutput({
+    agentId,
+    ...payload
+  }: AgentScopedPayload<GetBackgroundOutputPayload>) {
+    return (await this.getAgent(agentId)).getBackgroundOutput(payload);
+  }
+
+  async getContext({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
+    return (await this.getAgent(agentId)).getContext(payload);
+  }
+
+  async getConfig({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
+    return (await this.getAgent(agentId)).getConfig(payload);
+  }
+
+  async getPermission({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
+    return (await this.getAgent(agentId)).getPermission(payload);
+  }
+
+  async getPlan({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
+    return (await this.getAgent(agentId)).getPlan(payload);
+  }
+
+  async getUsage({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
+    return (await this.getAgent(agentId)).getUsage(payload);
+  }
+
+  async getTools({ agentId, ...payload }: AgentScopedPayload<EmptyPayload>) {
+    return (await this.getAgent(agentId)).getTools(payload);
+  }
+
+  async getBackground({ agentId, ...payload }: AgentScopedPayload<GetBackgroundPayload>) {
+    return (await this.getAgent(agentId)).getBackground(payload);
+  }
+
+  private async getAgent(agentId: string): Promise<PromisableMethods<AgentAPI>> {
+    const agent = await this.session.ensureAgentResumed(agentId);
     return agent.rpcMethods;
   }
 

@@ -6,16 +6,18 @@ import type { Tool } from '@moonshot-ai/kosong';
 
 import { abortable } from '../utils/abort';
 import { HttpMcpClient } from './client-http';
+import { isRemoteMcpConfig } from './client-remote';
+import { SseMcpClient } from './client-sse';
 import type { UnexpectedCloseReason } from './client-shared';
 import { StdioMcpClient } from './client-stdio';
 import type { McpOAuthService } from './oauth';
-import { assertMcpInputSchema, type MCPClient } from './types';
+import { assertMcpInputSchema, type MCPClient, type MCPToolDefinition } from './types';
 
 export type McpServerStatus = 'pending' | 'connected' | 'failed' | 'disabled' | 'needs-auth';
 
 export interface McpServerEntry {
   readonly name: string;
-  readonly transport: 'stdio' | 'http';
+  readonly transport: McpServerConfig['transport'];
   readonly status: McpServerStatus;
   readonly toolCount: number;
   readonly error?: string;
@@ -27,6 +29,8 @@ interface InternalEntry {
   attemptId: number;
   status: McpServerStatus;
   tools?: readonly Tool[];
+  /** Verbatim `tools/list` result the converted {@link tools} came from. */
+  rawTools?: readonly MCPToolDefinition[];
   enabledNames?: ReadonlySet<string>;
   error?: string;
   client?: RuntimeMcpClient;
@@ -36,12 +40,13 @@ export type McpStatusListener = (entry: McpServerEntry) => void;
 
 const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
 
-type RuntimeMcpClient = StdioMcpClient | HttpMcpClient;
+type RuntimeMcpClient = StdioMcpClient | HttpMcpClient | SseMcpClient;
 
 export interface McpConnectionManagerOptions {
   readonly envLookup?: (name: string) => string | undefined;
+  readonly stdioCwd?: string;
   /**
-   * Optional OAuth orchestrator. When provided, HTTP servers without a
+   * Optional OAuth orchestrator. When provided, remote servers without a
    * static bearer token participate in the OAuth-via-synthetic-tool flow:
    *  - If `oauthService.hasTokens(name, url)` is true, the provider is
    *    attached to the transport so the SDK can refresh tokens on 401.
@@ -88,15 +93,23 @@ export class McpConnectionManager {
   }
 
   /**
-   * Returns the URL of an HTTP MCP server by name, or `undefined` for
-   * unknown / non-HTTP / disabled entries. Used by the synthetic auth tool
+   * Returns the URL of a remote MCP server by name, or `undefined` for
+   * unknown / non-remote / disabled entries. Used by the synthetic auth tool
    * to drive OAuth discovery against the right base URL.
    */
-  getHttpServerUrl(name: string): string | undefined {
+  getRemoteServerUrl(name: string): string | undefined {
     const entry = this.entries.get(name);
     if (entry === undefined) return undefined;
-    if (entry.config.transport !== 'http') return undefined;
+    if (!isRemoteMcpConfig(entry.config)) return undefined;
     return entry.config.url;
+  }
+
+  /**
+   * @deprecated Use {@link getRemoteServerUrl}. Kept for in-repo callers that
+   * were written before legacy SSE support shared the same OAuth path.
+   */
+  getHttpServerUrl(name: string): string | undefined {
+    return this.getRemoteServerUrl(name);
   }
 
   onStatusChange(listener: McpStatusListener): () => void {
@@ -125,12 +138,18 @@ export class McpConnectionManager {
   resolved(
     name: string,
   ):
-    | { client: MCPClient; tools: readonly Tool[]; enabledNames: ReadonlySet<string> }
+    | {
+        client: MCPClient;
+        tools: readonly Tool[];
+        rawTools: readonly MCPToolDefinition[];
+        enabledNames: ReadonlySet<string>;
+      }
     | undefined {
     const entry = this.entries.get(name);
     if (
       entry?.status !== 'connected' ||
       entry.tools === undefined ||
+      entry.rawTools === undefined ||
       entry.client === undefined
     ) {
       return undefined;
@@ -138,6 +157,7 @@ export class McpConnectionManager {
     return {
       client: entry.client,
       tools: entry.tools,
+      rawTools: entry.rawTools,
       enabledNames: entry.enabledNames ?? new Set(entry.tools.map((t) => t.name)),
     };
   }
@@ -153,6 +173,39 @@ export class McpConnectionManager {
     });
     this.initialLoad = initialLoad;
     return initialLoad;
+  }
+
+  async connect(name: string, config: McpServerConfig): Promise<void> {
+    const previous = this.entries.get(name);
+    if (previous !== undefined) {
+      await this.closeClient(previous);
+    }
+    const disabled = config.enabled === false;
+    const entry: InternalEntry = {
+      name,
+      config,
+      attemptId: 0,
+      status: disabled ? 'disabled' : 'pending',
+    };
+    this.entries.set(name, entry);
+    this.emit(entry);
+    if (!disabled) {
+      await this.connectOne(entry, this.beginConnectAttempt(entry));
+    }
+  }
+
+  async remove(name: string): Promise<boolean> {
+    const entry = this.entries.get(name);
+    if (entry === undefined) return false;
+    await this.closeClient(entry);
+    entry.status = 'disabled';
+    entry.tools = undefined;
+    entry.rawTools = undefined;
+    entry.enabledNames = undefined;
+    entry.error = undefined;
+    this.emit(entry);
+    this.entries.delete(name);
+    return true;
   }
 
   waitForInitialLoad(signal?: AbortSignal): Promise<void> {
@@ -199,6 +252,7 @@ export class McpConnectionManager {
     if (!this.isCurrent(entry, attemptId)) return;
     entry.status = 'pending';
     entry.tools = undefined;
+    entry.rawTools = undefined;
     entry.enabledNames = undefined;
     entry.error = undefined;
     this.emit(entry);
@@ -220,7 +274,7 @@ export class McpConnectionManager {
       const startupClient = this.createClient(entry.config, entry.name);
       client = startupClient;
       entry.client = startupClient;
-      const tools = await withTimeout(
+      const discovered = await withTimeout(
         this.connectAndDiscoverTools(startupClient),
         timeoutMs,
         () => {
@@ -232,8 +286,9 @@ export class McpConnectionManager {
         await this.closeRuntimeClient(startupClient);
         return;
       }
-      entry.tools = tools;
-      entry.enabledNames = computeEnabledNames(entry.config, tools);
+      entry.tools = discovered.tools;
+      entry.rawTools = discovered.rawTools;
+      entry.enabledNames = computeEnabledNames(entry.config, discovered.tools);
       entry.status = 'connected';
       this.watchForUnexpectedClose(entry, startupClient, attemptId);
     } catch (error) {
@@ -251,6 +306,7 @@ export class McpConnectionManager {
         entry.error = formatStartupError(error, client);
       }
       entry.tools = undefined;
+      entry.rawTools = undefined;
       entry.enabledNames = undefined;
       // Drop the client reference so a later reconnect builds a fresh one.
       await this.closeClient(entry);
@@ -272,6 +328,7 @@ export class McpConnectionManager {
       entry.status = 'failed';
       entry.error = formatUnexpectedCloseError(entry.name, reason);
       entry.tools = undefined;
+      entry.rawTools = undefined;
       entry.enabledNames = undefined;
       entry.client = undefined;
       // Best-effort close; the transport is already gone, but this lets the
@@ -289,7 +346,14 @@ export class McpConnectionManager {
   private createClient(config: McpServerConfig, name: string): RuntimeMcpClient {
     const toolCallTimeoutMs = config.toolTimeoutMs;
     if (config.transport === 'stdio') {
-      return new StdioMcpClient(config, { toolCallTimeoutMs });
+      return new StdioMcpClient(config, { toolCallTimeoutMs, defaultCwd: this.options.stdioCwd });
+    }
+    if (config.transport === 'sse') {
+      return new SseMcpClient(config, {
+        toolCallTimeoutMs,
+        envLookup: this.options.envLookup,
+        oauthProvider: this.resolveOAuthProvider(config, name),
+      });
     }
     return new HttpMcpClient(config, {
       toolCallTimeoutMs,
@@ -304,7 +368,7 @@ export class McpConnectionManager {
   ): ReturnType<McpOAuthService['getProvider']> | undefined {
     const oauthService = this.oauthService;
     if (oauthService === undefined) return undefined;
-    if (config.transport !== 'http') return undefined;
+    if (!isRemoteMcpConfig(config)) return undefined;
     if (config.bearerTokenEnvVar !== undefined) return undefined;
     // Only attach the provider once tokens have been minted; before that,
     // the transport should propagate a clean 401 so we can flip the entry
@@ -316,7 +380,7 @@ export class McpConnectionManager {
 
   private shouldMarkNeedsAuth(entry: InternalEntry, error: unknown): boolean {
     if (this.oauthService === undefined) return false;
-    if (entry.config.transport !== 'http') return false;
+    if (!isRemoteMcpConfig(entry.config)) return false;
     if (entry.config.bearerTokenEnvVar !== undefined) return false;
     // If the user pinned a static `headers` block, treat 401s as a bad header
     // rather than hijacking them into the OAuth flow — the real error is more
@@ -326,14 +390,19 @@ export class McpConnectionManager {
     return isUnauthorizedLikeError(error);
   }
 
-  private async connectAndDiscoverTools(client: RuntimeMcpClient): Promise<Tool[]> {
+  private async connectAndDiscoverTools(
+    client: RuntimeMcpClient,
+  ): Promise<{ tools: Tool[]; rawTools: MCPToolDefinition[] }> {
     await client.connect();
     const mcpTools = await client.listTools();
-    return mcpTools.map((mcpTool) => ({
-      name: mcpTool.name,
-      description: mcpTool.description,
-      parameters: assertMcpInputSchema(mcpTool.name, mcpTool.inputSchema),
-    }));
+    return {
+      rawTools: mcpTools,
+      tools: mcpTools.map((mcpTool) => ({
+        name: mcpTool.name,
+        description: mcpTool.description,
+        parameters: assertMcpInputSchema(mcpTool.name, mcpTool.inputSchema),
+      })),
+    };
   }
 
   private async closeClient(entry: InternalEntry): Promise<void> {

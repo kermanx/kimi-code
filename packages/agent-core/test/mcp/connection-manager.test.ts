@@ -1,10 +1,11 @@
+import { realpathSync } from 'node:fs';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join } from 'pathe';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { localKaos } from '@moonshot-ai/kaos';
+import { testKaos } from '../fixtures/test-kaos';
 import type { ProviderConfig } from '@moonshot-ai/kosong';
 import { describe, expect, it } from 'vitest';
 
@@ -21,18 +22,18 @@ import type {
 import { z } from 'zod';
 
 import { KimiError } from '../../src/errors';
-import { ProviderManager } from '../../src/providers/provider-manager';
+import { ProviderManager } from '../../src/session/provider-manager';
 import { McpConnectionManager, type McpServerEntry } from '../../src/mcp/connection-manager';
 import { JsonFileStore, McpOAuthService } from '../../src/mcp/oauth';
 import type { AgentEvent, SDKSessionRPC } from '../../src/rpc';
 import { Session } from '../../src/session';
 import { SessionAPIImpl } from '../../src/session/rpc';
-import { detectEnvironmentFromNode } from '../../src/utils/environment';
 import { createScriptedGenerate } from '../agent/harness';
+
 
 const here = import.meta.dirname;
 const stdioFixture = join(here, 'fixtures', 'mock-stdio-server.mjs');
-const slowStdioFixture = join(here, 'fixtures', 'slow-stdio-server.mjs');
+const cwdStdioFixture = join(here, 'fixtures', 'cwd-stdio-server.mjs');
 const crashAfterConnectFixture = join(here, 'fixtures', 'crash-after-connect-stdio-server.mjs');
 const stderrThenExitFixture = join(here, 'fixtures', 'stderr-then-exit-stdio-server.mjs');
 const MOCK_PROVIDER: ProviderConfig = {
@@ -117,6 +118,25 @@ describe('McpConnectionManager', () => {
     }
   });
 
+  it('marks SSE servers failed when configured bearer token env var is missing', async () => {
+    const cm = new McpConnectionManager({ envLookup: () => undefined });
+    try {
+      await cm.connectAll({
+        legacy: {
+          transport: 'sse',
+          url: 'https://example.invalid/sse',
+          bearerTokenEnvVar: 'LEGACY_MCP_TOKEN',
+        },
+      });
+      const entry = cm.get('legacy');
+      expect(entry?.transport).toBe('sse');
+      expect(entry?.status).toBe('failed');
+      expect(entry?.error).toContain('"LEGACY_MCP_TOKEN" is not set or is empty');
+    } finally {
+      await cm.shutdown();
+    }
+  });
+
   it('marks disabled servers without attempting a connection', async () => {
     const cm = new McpConnectionManager();
     try {
@@ -140,6 +160,14 @@ describe('McpConnectionManager', () => {
       const resolved = cm.resolved('filtered');
       expect(resolved).toBeDefined();
       expect([...(resolved?.enabledNames ?? [])]).toEqual(['echo']);
+      // The raw tools/list result stays verbatim and unfiltered — the
+      // allow-list only gates registration, not the discovery trace.
+      const rawNames = resolved?.rawTools.map((tool) => tool.name) ?? [];
+      expect(rawNames).toContain('echo');
+      expect(rawNames).toContain('boom');
+      for (const rawTool of resolved?.rawTools ?? []) {
+        expect(rawTool.inputSchema).toBeDefined();
+      }
       const entry = cm.get('filtered');
       expect(entry?.toolCount).toBe(1);
     } finally {
@@ -189,7 +217,7 @@ describe('McpConnectionManager', () => {
     cm.onStatusChange((entry) => {
       seen.push({ name: entry.name, status: entry.status });
     });
-    const delayedMockServer = `setTimeout(() => import(${JSON.stringify(pathToFileURL(stdioFixture).href)}), 250)`;
+    const delayedMockServer = `setTimeout(() => import(${JSON.stringify(pathToFileURL(stdioFixture).href)}), 160)`;
 
     const connect = cm.connectAll({
       slow: {
@@ -201,7 +229,9 @@ describe('McpConnectionManager', () => {
     });
 
     try {
-      await sleep(50);
+      // Let the first attempt get in-flight, then supersede it: reconnect
+      // must land before the delayed child finishes its 160ms startup.
+      await sleep(40);
       await cm.reconnect('slow');
       await connect;
 
@@ -377,6 +407,47 @@ describe('McpConnectionManager', () => {
     }
   }, 15000);
 
+  it('flips SSE servers into needs-auth when the server returns 401 and no static token is set', async () => {
+    const server: HttpServer = createHttpServer((_req, res) => {
+      res.writeHead(401, {
+        'content-type': 'text/plain',
+        'www-authenticate': 'Bearer realm="mcp", resource_metadata="http://x/.well-known/oauth-protected-resource"',
+      });
+      res.end('unauthorized');
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as HttpAddress).port;
+    const storeDir = await mkdtemp(join(tmpdir(), 'kimi-mcp-oauth-sse-cm-'));
+    const oauthService = new McpOAuthService({ store: new JsonFileStore(storeDir) });
+    const cm = new McpConnectionManager({ oauthService });
+    try {
+      await cm.connectAll({
+        legacy: {
+          transport: 'sse',
+          url: `http://127.0.0.1:${port}/sse`,
+          startupTimeoutMs: 5_000,
+        },
+      });
+      const entry = cm.get('legacy');
+      expect(entry?.transport).toBe('sse');
+      expect(entry?.status).toBe('needs-auth');
+      expect(entry?.error).toContain('run /mcp-config login legacy');
+      expect(entry?.toolCount).toBe(0);
+    } finally {
+      await cm.shutdown();
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => {
+          if (err) {
+            reject(err);
+            return;
+          }
+          resolve();
+        });
+      });
+      await rm(storeDir, { recursive: true, force: true });
+    }
+  }, 15000);
+
   it('flips cached OAuth credentials that require reauth into needs-auth', async () => {
     const server: HttpServer = createHttpServer((req, res) => {
       if (req.url === '/token') {
@@ -488,7 +559,7 @@ describe('McpConnectionManager', () => {
           transport: 'stdio',
           command: process.execPath,
           args: [crashAfterConnectFixture],
-          env: { KIMI_TEST_MCP_EXIT_AFTER_MS: '50', KIMI_TEST_MCP_STDERR: 'fatal: out of memory' },
+          env: { KIMI_TEST_MCP_EXIT_AFTER_MS: '500', KIMI_TEST_MCP_STDERR: 'fatal: out of memory' },
           startupTimeoutMs: 4_000,
         },
       });
@@ -663,13 +734,9 @@ describe('Session MCP startup', () => {
 
     const session = new Session({
       id: 'test-mcp-oauth',
-      runtime: {
-        kaos: localKaos,
-        osEnv: await detectEnvironmentFromNode(),
-      },
+      kaos: testKaos.withCwd(tmp),
       homedir: join(tmp, 'session'),
       kimiHomeDir: kimiHome,
-      cwd: tmp,
       rpc: sessionRpc(),
     });
 
@@ -706,21 +773,23 @@ describe('Session MCP startup', () => {
 
   it('does not block main agent creation on slow MCP startup', async () => {
     const tmp = await mkdtemp(join(tmpdir(), 'kimi-session-mcp-startup-'));
+    // The child never completes the MCP handshake — it idles, keeping startup
+    // in-flight — but exits the instant the parent closes stdin, so
+    // session.close() does not wait out the SDK transport's close grace. The
+    // 800ms idle keeps startup pending long enough that a createMain blocked
+    // on MCP would lose the 500ms race below.
+    const idleServer = `process.stdin.on('end', () => process.exit(0)); process.stdin.resume(); setTimeout(() => {}, 800)`;
     const session = new Session({
       id: 'test-mcp-slow',
-      runtime: {
-        kaos: localKaos,
-        osEnv: await detectEnvironmentFromNode(),
-      },
+      kaos: testKaos.withCwd(tmp),
       homedir: join(tmp, 'session'),
-      cwd: tmp,
       rpc: sessionRpc(),
       mcpConfig: {
         servers: {
           slow: {
             transport: 'stdio',
             command: process.execPath,
-            args: [slowStdioFixture],
+            args: ['-e', idleServer],
             startupTimeoutMs: 2_000,
           },
         },
@@ -731,12 +800,46 @@ describe('Session MCP startup', () => {
     try {
       const result = await Promise.race([
         create.then(() => 'resolved' as const),
-        sleep(1_000).then(() => 'blocked' as const),
+        sleep(500).then(() => 'blocked' as const),
       ]);
       expect(result).toBe('resolved');
     } finally {
       await session.close();
       await Promise.race([create.catch(() => {}), sleep(1_000)]);
+      await rm(tmp, { recursive: true, force: true, maxRetries: 3, retryDelay: 10 });
+    }
+  }, 7000);
+
+  it('starts stdio MCP servers in the session cwd when config.cwd is omitted', async () => {
+    const tmp = await mkdtemp(join(tmpdir(), 'kimi-session-mcp-cwd-'));
+    const session = new Session({
+      id: 'test-mcp-cwd',
+      kaos: testKaos.withCwd(tmp),
+      homedir: join(tmp, 'session'),
+      rpc: sessionRpc(),
+      mcpConfig: {
+        servers: {
+          cwd: {
+            transport: 'stdio',
+            command: process.execPath,
+            args: [cwdStdioFixture],
+            startupTimeoutMs: 2_000,
+          },
+        },
+      },
+    });
+
+    try {
+      await session.mcp.waitForInitialLoad();
+      const resolved = session.mcp.resolved('cwd');
+      if (resolved === undefined) {
+        throw new Error('MCP server cwd did not connect');
+      }
+      const result = await resolved.client.callTool('get_cwd', {});
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+      expect(realpathSync(text)).toBe(realpathSync(tmp));
+    } finally {
+      await session.close();
       await rm(tmp, { recursive: true, force: true, maxRetries: 3, retryDelay: 10 });
     }
   }, 7000);
@@ -752,12 +855,8 @@ describe('Session MCP startup', () => {
     scripted.mockNextResponse({ type: 'text', text: 'ready' });
     const session = new Session({
       id: 'test-mcp-turn-ended',
-      runtime: {
-        kaos: localKaos,
-        osEnv: await detectEnvironmentFromNode(),
-      },
+      kaos: testKaos.withCwd(tmp),
       homedir: join(tmp, 'session'),
-      cwd: tmp,
       rpc: sessionRpc({
         events,
         onEvent: (event) => {
@@ -787,7 +886,7 @@ describe('Session MCP startup', () => {
         cwd: tmp,
         modelAlias: 'mock-model',
         systemPrompt: 'test system prompt',
-        thinkingLevel: 'off',
+        thinkingEffort: 'off',
       });
       // This bare agent gets no profile, so grant MCP access explicitly.
       agent.tools.setActiveTools(['mcp__*']);
@@ -823,12 +922,8 @@ describe('Session MCP startup', () => {
     const events: SessionRpcEvent[] = [];
     const session = new Session({
       id: 'test-mcp-mixed',
-      runtime: {
-        kaos: localKaos,
-        osEnv: await detectEnvironmentFromNode(),
-      },
+      kaos: testKaos.withCwd(tmp),
       homedir: join(tmp, 'session'),
-      cwd: tmp,
       rpc: sessionRpc({ events }),
       mcpConfig: {
         servers: {

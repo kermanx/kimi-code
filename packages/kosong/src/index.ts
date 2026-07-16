@@ -19,19 +19,32 @@ export type {
   TextPart,
   ThinkPart,
   ToolCall,
-  ToolCallFunction,
   ToolCallPart,
   VideoURLPart,
 } from './message';
 
 // Provider interfaces
 export * from './provider';
-export { createProvider } from './providers';
-export type { ProviderConfig } from './providers';
+export { createProvider, getModelCapability } from './providers';
+export type { ProviderConfig, ProviderType } from './providers';
+// Kimi provider: exported so callers can narrow a `ChatProvider` to the Kimi
+// backend (instanceof) and apply Kimi-specific request params (generation
+// kwargs, `thinking.keep` extra body).
+export { KimiChatProvider } from './providers/kimi';
+export type { ExtraBody, GenerationKwargs, KimiOptions, ThinkingConfig } from './providers/kimi';
 
 // Model capability matrix
-export { UNKNOWN_CAPABILITY, isUnknownCapability } from './capability';
+export { isUnknownCapability, UNKNOWN_CAPABILITY } from './capability';
 export type { ModelCapability } from './capability';
+
+// Model catalog (models.dev-style) metadata
+export {
+  catalogBaseUrl,
+  catalogModelToCapability,
+  catalogProviderModels,
+  inferWireType,
+} from './catalog';
+export type { Catalog, CatalogModel, CatalogModelEntry, CatalogProviderEntry } from './catalog';
 
 // Core functions
 export { generate } from './generate';
@@ -49,9 +62,18 @@ export {
   APIConnectionError,
   APIContextOverflowError,
   APIEmptyResponseError,
+  APIProviderRateLimitError,
+  APIRequestTooLargeError,
   APIStatusError,
   APITimeoutError,
   ChatProviderError,
+  isContextOverflowStatusError,
+  isImageFormatError,
+  isProviderRateLimitError,
+  isRecoverableRequestStructureError,
+  isRequestTooLargeStatusError,
+  isRetryableGenerateError,
+  isToolExchangeAdjacencyError,
 } from './errors';
 
 /**

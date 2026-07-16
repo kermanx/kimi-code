@@ -1,12 +1,17 @@
-import type { ModelCapability } from '#/capability';
-import { ChatProviderError } from '#/errors';
+import {
+  APIContextOverflowError,
+  APIProviderRateLimitError,
+  ChatProviderError,
+  isContextOverflowErrorCode,
+} from '#/errors';
 import type { ContentPart, Message, StreamedMessagePart, ToolCall } from '#/message';
-import { extractText } from '#/message';
+import { extractText, isToolDeclarationOnlyMessage } from '#/message';
 import type {
   ChatProvider,
   FinishReason,
   GenerateOptions,
   ProviderRequestAuth,
+  ResponseFormat,
   StreamedMessage,
   ThinkingEffort,
 } from '#/provider';
@@ -14,21 +19,24 @@ import type { Tool } from '#/tool';
 import type { TokenUsage } from '#/usage';
 import OpenAI from 'openai';
 
-import {
-  getOpenAIResponsesModelCapability,
-  usesOpenAIResponsesDeveloperRole,
-} from './capability-registry';
+import { usesOpenAIResponsesDeveloperRole } from './capability-registry';
 import {
   convertOpenAIError,
+  isMediaPart,
+  TOOL_RESULT_MEDIA_PLACEHOLDER,
+  TOOL_RESULT_MEDIA_PROMPT,
   type ToolMessageConversion,
-  reasoningEffortToThinkingEffort,
-  thinkingEffortToReasoningEffort,
 } from './openai-common';
 import {
   mergeRequestHeaders,
   requireProviderApiKey,
   resolveAuthBackedClient,
 } from './request-auth';
+import {
+  normalizeToolCallIdsForProvider,
+  sanitizeOpenAIResponsesCallId,
+  type ToolCallIdPolicy,
+} from './tool-call-id';
 
 /**
  * Normalize the Responses API status / incomplete_details into the unified
@@ -68,6 +76,10 @@ function normalizeResponsesFinishReason(
 }
 
 type RawObject = Record<string, unknown>;
+const OPENAI_RESPONSES_TOOL_CALL_ID_POLICY: ToolCallIdPolicy = {
+  normalize: (id) => sanitizeOpenAIResponsesCallId(id, 64),
+  maxLength: 64,
+};
 
 type ResponseOutputItemView =
   | {
@@ -100,6 +112,10 @@ function asRawObject(value: unknown): RawObject | null {
 function readStringField(object: RawObject, key: string): string | undefined {
   const value = object[key];
   return typeof value === 'string' ? value : undefined;
+}
+
+function hasOwn(object: RawObject, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(object, key);
 }
 
 function readNullableStringField(object: RawObject, key: string): string | null | undefined {
@@ -217,12 +233,102 @@ function formatResponsesErrorEvent(
   return `${codeText}: ${message}${paramText}`;
 }
 
-function formatResponsesFailedResponse(response: RawObject): string {
+const EMBEDDED_STATUS_CODE_RE = /\bstatus_code\s*[:=]\s*(\d{3})\b/;
+
+function readEmbeddedStatusCode(message: string): number | undefined {
+  const match = EMBEDDED_STATUS_CODE_RE.exec(message);
+  return match === null ? undefined : Number(match[1]);
+}
+
+function errorFromOpenAIResponsesEvent(
+  prefix: string,
+  code: string | null,
+  message: string,
+  param: string | null,
+): ChatProviderError {
+  const formatted = formatResponsesErrorEvent(code, message, param);
+  const fullMessage = `${prefix}: ${formatted}`;
+  if (isContextOverflowErrorCode(code)) {
+    return new APIContextOverflowError(400, fullMessage);
+  }
+  if (code === 'rate_limit_exceeded' || readEmbeddedStatusCode(message) === 429) {
+    return new APIProviderRateLimitError(fullMessage);
+  }
+  return new ChatProviderError(fullMessage);
+}
+
+function parseNestedGatewayStreamError(message: string):
+  | {
+      code: string | null;
+      message: string;
+      param: string | null;
+    }
+  | undefined {
+  const marker = 'received error while streaming:';
+  const markerIndex = message.indexOf(marker);
+  if (markerIndex === -1) return undefined;
+
+  const jsonText = message.slice(markerIndex + marker.length).trim();
+  if (jsonText.length === 0) return undefined;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    return undefined;
+  }
+
+  const error = asRawObject(parsed);
+  if (error === null) return undefined;
+
+  const nestedMessage = readStringField(error, 'message');
+  if (nestedMessage === undefined) return undefined;
+
+  return {
+    code: readNullableStringField(error, 'code') ?? null,
+    message: nestedMessage,
+    param: readNullableStringField(error, 'param') ?? null,
+  };
+}
+
+function malformedStreamErrorEvent(message: string): ChatProviderError {
+  const nested = parseNestedGatewayStreamError(message);
+  if (nested !== undefined) {
+    return errorFromOpenAIResponsesEvent(
+      'OpenAI Responses malformed stream error',
+      nested.code,
+      nested.message,
+      nested.param,
+    );
+  }
+
+  return errorFromOpenAIResponsesEvent(
+    'OpenAI Responses malformed stream error',
+    null,
+    message,
+    null,
+  );
+}
+
+function readResponsesFailedResponseError(response: RawObject):
+  | {
+      code: string | null;
+      message: string;
+    }
+  | undefined {
   const error = readObjectField(response, 'error');
   if (error !== undefined) {
     const code = readNullableStringField(error, 'code') ?? 'unknown';
     const message = readStringField(error, 'message') ?? 'no message';
-    return `${code}: ${message}`;
+    return { code, message };
+  }
+  return undefined;
+}
+
+function formatResponsesFailedResponse(response: RawObject): string {
+  const error = readResponsesFailedResponseError(response);
+  if (error !== undefined) {
+    return formatResponsesErrorEvent(error.code, error.message, null);
   }
 
   const incompleteDetails = readObjectField(response, 'incomplete_details');
@@ -262,6 +368,28 @@ interface ResponseToolParam {
   parameters: Record<string, unknown>;
   strict: boolean;
 }
+
+function responseFormatToResponsesText(format: ResponseFormat): Record<string, unknown> {
+  if (format.type === 'json_object') {
+    return { format: { type: 'json_object' } };
+  }
+  return {
+    format: {
+      type: 'json_schema',
+      name: format.jsonSchema.name,
+      schema: format.jsonSchema.schema,
+      strict: format.jsonSchema.strict,
+      description: format.jsonSchema.description,
+    },
+  };
+}
+
+// The Responses API has no input type for video, and only mp3/wav audio can
+// be inlined as input_file data. Degrade such parts to placeholder text so
+// the model still learns an attachment existed instead of silently losing it.
+const OMITTED_AUDIO_PLACEHOLDER = '(audio omitted: unsupported audio format)';
+const OMITTED_VIDEO_PLACEHOLDER = '(video omitted: not supported by this provider)';
+
 function contentPartsToInputItems(parts: ContentPart[]): unknown[] {
   const items: unknown[] = [];
   for (const part of parts) {
@@ -280,14 +408,14 @@ function contentPartsToInputItems(parts: ContentPart[]): unknown[] {
         break;
       case 'audio_url': {
         const mapped = mapAudioUrlToInputItem(part.audioUrl.url);
-        if (mapped !== null) {
-          items.push(mapped);
-        }
+        items.push(mapped ?? { type: 'input_text', text: OMITTED_AUDIO_PLACEHOLDER });
         break;
       }
-      case 'think':
       case 'video_url':
-        // think: handled separately. video_url: not supported by Responses API.
+        items.push({ type: 'input_text', text: OMITTED_VIDEO_PLACEHOLDER });
+        break;
+      case 'think':
+        // Handled separately as reasoning items.
         break;
     }
   }
@@ -304,7 +432,7 @@ function contentPartsToOutputItems(parts: ContentPart[]): unknown[] {
   return items;
 }
 
-function messageContentToFunctionOutputItems(content: ContentPart[]): string | unknown[] {
+function messageContentToFunctionOutputItems(content: ContentPart[]): unknown[] {
   const items: unknown[] = [];
   for (const part of content) {
     switch (part.type) {
@@ -323,15 +451,14 @@ function messageContentToFunctionOutputItems(content: ContentPart[]): string | u
         // branch here, audio returned by a tool would be dropped on the
         // next turn.
         const mapped = mapAudioUrlToInputItem(part.audioUrl.url);
-        if (mapped !== null) {
-          items.push(mapped);
-        }
+        items.push(mapped ?? { type: 'input_text', text: OMITTED_AUDIO_PLACEHOLDER });
         break;
       }
-      case 'think':
       case 'video_url':
-        // think / video_url still intentionally skipped: the Responses
-        // API has no representation for them inside a function_call_output.
+        items.push({ type: 'input_text', text: OMITTED_VIDEO_PLACEHOLDER });
+        break;
+      case 'think':
+        // Handled separately as reasoning items.
         break;
     }
   }
@@ -376,10 +503,20 @@ function convertMessage(
   // tool role -> function_call_output
   if (role === 'tool') {
     const callId = message.toolCallId ?? '';
-    const output: string | unknown[] =
-      toolMessageConversion === 'extract_text'
-        ? extractText(message)
-        : messageContentToFunctionOutputItems(message.content);
+    let output: string | unknown[];
+    if (toolMessageConversion === 'extract_text') {
+      // Plain-string output for backends that reject structured
+      // function_call_output. Media parts are reattached as a user message
+      // by `convertHistoryMessages`; when the result carries no text at
+      // all, point the model at that follow-up message.
+      const text = extractText(message);
+      output =
+        text.length === 0 && message.content.some(isMediaPart)
+          ? TOOL_RESULT_MEDIA_PLACEHOLDER
+          : text;
+    } else {
+      output = messageContentToFunctionOutputItems(message.content);
+    }
     return [
       {
         call_id: callId,
@@ -423,14 +560,14 @@ function convertMessage(
         flushPendingParts();
         // Aggregate consecutive ThinkParts with the same `encrypted` value
         const encryptedValue = part.encrypted;
-        const summaries: unknown[] = [{ type: 'summary_text', text: part.think || '' }];
+        const summaries: unknown[] = [{ type: 'summary_text', text: part.think }];
         i += 1;
         while (i < n) {
           const nextPart = message.content[i];
           if (nextPart === undefined) break;
           if (nextPart.type !== 'think') break;
           if (nextPart.encrypted !== encryptedValue) break;
-          summaries.push({ type: 'summary_text', text: nextPart.think || '' });
+          summaries.push({ type: 'summary_text', text: nextPart.think });
           i += 1;
         }
         result.push({
@@ -451,9 +588,9 @@ function convertMessage(
   // Handle tool calls
   for (const toolCall of message.toolCalls) {
     result.push({
-      arguments: toolCall.function.arguments ?? '{}',
+      arguments: toolCall.arguments ?? '{}',
       call_id: toolCall.id,
-      name: toolCall.function.name,
+      name: toolCall.name,
       type: 'function_call',
     });
   }
@@ -469,6 +606,53 @@ function convertTool(tool: Tool): ResponseToolParam {
     parameters: tool.parameters,
     strict: false,
   };
+}
+
+/**
+ * Convert the history, buffering tool-result media when `extract_text`
+ * flattens tool outputs to plain strings. The buffered media items are
+ * reattached as a single user message after each run of consecutive tool
+ * messages — mirroring the OpenAI Chat Completions provider.
+ */
+function convertHistoryMessages(
+  history: readonly Message[],
+  modelName: string,
+  toolMessageConversion: ToolMessageConversion,
+): unknown[] {
+  const input: unknown[] = [];
+  const pendingToolResultMedia: unknown[] = [];
+
+  const flushPendingMedia = (): void => {
+    if (pendingToolResultMedia.length === 0) return;
+    input.push({
+      type: 'message',
+      role: 'user',
+      content: [
+        { type: 'input_text', text: TOOL_RESULT_MEDIA_PROMPT },
+        ...pendingToolResultMedia,
+      ],
+    });
+    pendingToolResultMedia.length = 0;
+  };
+
+  for (const msg of history) {
+    // Message-level tool declarations are a Kimi wire feature; skipped here
+    // because the leftover content-free message item is rejected by the
+    // Responses API. See isToolDeclarationOnlyMessage.
+    if (isToolDeclarationOnlyMessage(msg)) continue;
+    if (msg.role !== 'tool') {
+      flushPendingMedia();
+    }
+    input.push(...convertMessage(msg, modelName, toolMessageConversion));
+    if (msg.role === 'tool' && toolMessageConversion === 'extract_text') {
+      pendingToolResultMedia.push(
+        ...messageContentToFunctionOutputItems(msg.content.filter(isMediaPart)),
+      );
+    }
+  }
+
+  flushPendingMedia();
+  return input;
 }
 export class OpenAIResponsesStreamedMessage implements StreamedMessage {
   private _id: string | null = null;
@@ -556,19 +740,26 @@ export class OpenAIResponsesStreamedMessage implements StreamedMessage {
         yield {
           type: 'function',
           id: functionCallId(outputItem.callId),
-          function: {
-            name: requireFunctionCallName(outputItem),
-            arguments: outputItem.arguments ?? null,
-          },
+          name: requireFunctionCallName(outputItem),
+          arguments: outputItem.arguments ?? null,
         } satisfies ToolCall;
       } else if (outputItem.type === 'reasoning') {
+        let hasReasoningSummary = false;
         for (const summary of outputItem.summary) {
           const text = readStringField(summary, 'text');
           if (text === undefined) continue;
+          hasReasoningSummary = true;
           const thinkPart: StreamedMessagePart = {
             type: 'think',
             think: text,
           };
+          if (outputItem.encryptedContent !== undefined) {
+            (thinkPart as { encrypted: string }).encrypted = outputItem.encryptedContent;
+          }
+          yield thinkPart;
+        }
+        if (!hasReasoningSummary) {
+          const thinkPart: StreamedMessagePart = { type: 'think', think: '' };
           if (outputItem.encryptedContent !== undefined) {
             (thinkPart as { encrypted: string }).encrypted = outputItem.encryptedContent;
           }
@@ -665,7 +856,16 @@ export class OpenAIResponsesStreamedMessage implements StreamedMessage {
 
     try {
       for await (const chunk of response) {
-        const type = requireStringField(chunk, 'type', 'stream event');
+        const type = readStringField(chunk, 'type');
+        if (type === undefined) {
+          if (!hasOwn(chunk, 'type')) {
+            const message = readStringField(chunk, 'message');
+            if (message !== undefined) {
+              throw malformedStreamErrorEvent(message);
+            }
+          }
+          failResponsesDecode('stream event.type', 'must be a string.');
+        }
 
         switch (type) {
           case 'response.output_text.delta':
@@ -701,10 +901,8 @@ export class OpenAIResponsesStreamedMessage implements StreamedMessage {
               const tc: ToolCall = {
                 type: 'function',
                 id: functionCallId(item.callId),
-                function: {
-                  name: requireFunctionCallName(item),
-                  arguments: item.arguments ?? null,
-                },
+                name: requireFunctionCallName(item),
+                arguments: item.arguments ?? null,
               };
               if (streamIndex !== undefined) {
                 tc._streamIndex = streamIndex;
@@ -781,16 +979,24 @@ export class OpenAIResponsesStreamedMessage implements StreamedMessage {
           }
           case 'error': {
             const message = requireStringField(chunk, 'message', type);
-            throw new ChatProviderError(
-              `OpenAI Responses stream error: ${formatResponsesErrorEvent(
-                readNullableStringField(chunk, 'code') ?? null,
-                message,
-                readNullableStringField(chunk, 'param') ?? null,
-              )}`,
+            throw errorFromOpenAIResponsesEvent(
+              'OpenAI Responses stream error',
+              readNullableStringField(chunk, 'code') ?? null,
+              message,
+              readNullableStringField(chunk, 'param') ?? null,
             );
           }
           case 'response.failed': {
             const responseObject = requireObjectField(chunk, 'response', type);
+            const error = readResponsesFailedResponseError(responseObject);
+            if (error !== undefined) {
+              throw errorFromOpenAIResponsesEvent(
+                'OpenAI Responses response.failed',
+                error.code,
+                error.message,
+                null,
+              );
+            }
             throw new ChatProviderError(
               `OpenAI Responses response.failed: ${formatResponsesFailedResponse(responseObject)}`,
             );
@@ -807,6 +1013,11 @@ export class OpenAIResponsesStreamedMessage implements StreamedMessage {
 }
 export class OpenAIResponsesChatProvider implements ChatProvider {
   readonly name: string = 'openai-responses';
+
+  /** See {@link ChatProvider.maxCompletionTokens}. */
+  get maxCompletionTokens(): number | undefined {
+    return this._generationKwargs.max_output_tokens;
+  }
 
   private _model: string;
   private _stream: boolean;
@@ -843,7 +1054,9 @@ export class OpenAIResponsesChatProvider implements ChatProvider {
   }
 
   get thinkingEffort(): ThinkingEffort | null {
-    return reasoningEffortToThinkingEffort(this._generationKwargs.reasoning_effort);
+    const effort = this._generationKwargs.reasoning_effort;
+    if (effort === undefined) return null;
+    return effort === 'none' ? 'off' : effort;
   }
 
   get modelParameters(): Record<string, unknown> {
@@ -854,10 +1067,6 @@ export class OpenAIResponsesChatProvider implements ChatProvider {
     };
   }
 
-  getCapability(model?: string): ModelCapability {
-    return getOpenAIResponsesModelCapability(model ?? this._model);
-  }
-
   async generate(
     systemPrompt: string,
     tools: Tool[],
@@ -865,17 +1074,14 @@ export class OpenAIResponsesChatProvider implements ChatProvider {
     options?: GenerateOptions,
   ): Promise<StreamedMessage> {
     const input: unknown[] = [];
-    if (systemPrompt) {
-      const sysItem: Record<string, unknown> = { role: 'system', content: systemPrompt };
-      if (usesOpenAIResponsesDeveloperRole(this._model)) {
-        sysItem['role'] = 'developer';
-      }
-      input.push(sysItem);
-    }
 
-    for (const msg of history) {
-      input.push(...convertMessage(msg, this._model, this._toolMessageConversion));
-    }
+    const normalizedHistory = normalizeToolCallIdsForProvider(
+      history,
+      OPENAI_RESPONSES_TOOL_CALL_ID_POLICY,
+    );
+    input.push(
+      ...convertHistoryMessages(normalizedHistory, this._model, this._toolMessageConversion),
+    );
 
     const kwargs: Record<string, unknown> = { ...this._generationKwargs };
     const reasoningEffort = kwargs['reasoning_effort'] as string | undefined;
@@ -907,6 +1113,15 @@ export class OpenAIResponsesChatProvider implements ChatProvider {
         stream: this._stream,
         ...kwargs,
       };
+      if (systemPrompt) {
+        createParams['instructions'] = systemPrompt;
+      }
+      if (options?.responseFormat !== undefined) {
+        createParams['text'] = {
+          ...asRawObject(createParams['text']),
+          ...responseFormatToResponsesText(options.responseFormat),
+        };
+      }
 
       if (
         !('responses' in client) ||
@@ -917,6 +1132,7 @@ export class OpenAIResponsesChatProvider implements ChatProvider {
         );
       }
 
+      options?.onRequestSent?.();
       const response = await (
         client.responses as {
           create(params: unknown, opts?: unknown): Promise<unknown>;
@@ -929,7 +1145,7 @@ export class OpenAIResponsesChatProvider implements ChatProvider {
   }
 
   withThinking(effort: ThinkingEffort): OpenAIResponsesChatProvider {
-    const reasoningEffort = thinkingEffortToReasoningEffort(effort);
+    const reasoningEffort = effort === 'off' || effort === 'on' ? undefined : effort;
     const clone = this._clone();
     clone._generationKwargs = {
       ...clone._generationKwargs,
@@ -942,6 +1158,10 @@ export class OpenAIResponsesChatProvider implements ChatProvider {
     const clone = this._clone();
     clone._generationKwargs = { ...clone._generationKwargs, ...kwargs };
     return clone;
+  }
+
+  withMaxCompletionTokens(maxCompletionTokens: number): OpenAIResponsesChatProvider {
+    return this.withGenerationKwargs({ max_output_tokens: maxCompletionTokens });
   }
 
   private _clone(): OpenAIResponsesChatProvider {

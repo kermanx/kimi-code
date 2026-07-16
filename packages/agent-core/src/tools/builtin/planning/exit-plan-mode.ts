@@ -3,18 +3,18 @@
  *
  * The LLM calls this tool to surface a finalised plan to the user and
  * exit plan mode. The plan must already be written to the current plan
- * file; this tool reads that file and flips plan mode off. PermissionManager
- * handles plan approval before this tool runs and passes any selected option
- * through execution metadata.
+ * file; this tool reads that file and flips plan mode off.
  */
 
 import type { Agent } from '#/agent';
+import type { PlanData } from '#/agent/plan';
 import { z } from 'zod';
 
 import type { BuiltinTool } from '../../../agent/tool';
-import type { ExecutableToolContext, ExecutableToolResult, ToolExecution } from '../../../loop/types';
+import type { ExecutableToolResult, ToolExecution } from '../../../loop/types';
+import type { ToolInputDisplay } from '../../display';
 import { toInputJsonSchema } from '../../support/input-schema';
-import DESCRIPTION from './exit-plan-mode.md';
+import DESCRIPTION from './exit-plan-mode.md?raw';
 
 // ── Input schema ─────────────────────────────────────────────────────
 
@@ -86,19 +86,38 @@ export class ExitPlanModeTool implements BuiltinTool<ExitPlanModeInput> {
 
   constructor(private readonly agent: Agent) {}
 
-  resolveExecution(args: ExitPlanModeInput): ToolExecution {
+  async resolveExecution(args: ExitPlanModeInput): Promise<ToolExecution> {
     return {
       description: 'Presenting plan and exiting plan mode',
-      execute: (ctx) => this.execution(args, ctx),
+      display: await this.resolvePlanReviewDisplay(args),
+      approvalRule: this.name,
+      execute: () => this.execution(args),
     };
   }
 
-  private async execution(
+  private async resolvePlanReviewDisplay(
     args: ExitPlanModeInput,
-    {
-    metadata,
-    }: ExecutableToolContext,
-  ): Promise<ExecutableToolResult> {
+  ): Promise<ToolInputDisplay | undefined> {
+    if (!this.agent.planMode.isActive) return undefined;
+    let data: PlanData;
+    try {
+      data = await this.agent.planMode.data();
+    } catch {
+      return undefined;
+    }
+    if (data === null || data.content.trim().length === 0) return undefined;
+    const display: ToolInputDisplay = {
+      kind: 'plan_review',
+      plan: data.content,
+      path: data.path,
+    };
+    if (args.options !== undefined && args.options.length >= 2) {
+      display.options = args.options;
+    }
+    return display;
+  }
+
+  private async execution(args: ExitPlanModeInput): Promise<ExecutableToolResult> {
     if (!this.agent.planMode.isActive) {
       return {
         isError: true,
@@ -110,38 +129,32 @@ export class ExitPlanModeTool implements BuiltinTool<ExitPlanModeInput> {
     const resolvedPlan = await this.resolvePlan();
     if (!resolvedPlan.ok) return resolvedPlan.error;
 
-    if (!planTelemetryWasSubmitted(metadata)) {
-      this.agent.telemetry.track('plan_submitted', {
-        has_options: args.options !== undefined && args.options.length >= 2,
-      });
-    }
-    return this.exitWithPlan(
-      resolvedPlan.plan,
-      resolvedPlan.path,
-      selectedOptionFromMetadata(metadata),
-      planTelemetryWasResolved(metadata),
-    );
-  }
+    this.agent.telemetry.track('plan_submitted', {
+      has_options: args.options !== undefined && args.options.length >= 2,
+    });
 
-  private async exitWithPlan(
-    plan: string,
-    path: string | undefined,
-    option: ExitPlanModeOption | undefined = undefined,
-    telemetryResolved = false,
-  ): Promise<ExecutableToolResult> {
     const failed = this.exitPlanMode();
     if (failed !== undefined) return failed;
 
-    if (!telemetryResolved) {
+    // Reaching `execute` means no interactive review ask intercepted the
+    // call. In auto permission mode the approval is automatic, so the
+    // output must not read as if the user had approved the plan. In
+    // manual / yolo modes the review-ask policy owns the user-facing
+    // result; the only way `execute` still runs there is a configured or
+    // session allow/ask rule — an explicit user decision that keeps the
+    // user-approved wording.
+    if (this.agent.permission.mode === 'auto') {
       this.agent.telemetry.track('plan_resolved', { outcome: 'auto_approved' });
+      return {
+        isError: false,
+        output: `Exited plan mode. ${formatAutoApprovedPlanForOutput(resolvedPlan.plan, resolvedPlan.path)}`,
+      };
     }
-    const optionPrefix =
-      option === undefined
-        ? ''
-        : `Selected approach: ${option.label}\nExecute ONLY the selected approach. Do not execute any unselected alternatives.\n\n`;
+
+    this.agent.telemetry.track('plan_resolved', { outcome: 'approved' });
     return {
       isError: false,
-      output: `Exited plan mode. ${optionPrefix}${formatPlanForOutput(plan, path)}`,
+      output: `Exited plan mode. ${formatPlanForOutput(resolvedPlan.plan, resolvedPlan.path)}`,
     };
   }
 
@@ -210,30 +223,9 @@ function normalizeOptionLabel(label: string): string {
   return label.trim().toLowerCase();
 }
 
-function selectedOptionFromMetadata(metadata: unknown): ExitPlanModeOption | undefined {
-  if (metadata === null || typeof metadata !== 'object') return undefined;
-  const selectedOption = (metadata as { readonly selectedOption?: unknown }).selectedOption;
-  if (selectedOption === null || typeof selectedOption !== 'object') return undefined;
-  const label = (selectedOption as { readonly label?: unknown }).label;
-  const description = (selectedOption as { readonly description?: unknown }).description;
-  if (typeof label !== 'string' || typeof description !== 'string') return undefined;
-  return { label, description };
-}
-
-function planTelemetryWasSubmitted(metadata: unknown): boolean {
-  return (
-    metadata !== null &&
-    typeof metadata === 'object' &&
-    (metadata as { readonly planTelemetrySubmitted?: unknown }).planTelemetrySubmitted === true
-  );
-}
-
-function planTelemetryWasResolved(metadata: unknown): boolean {
-  return (
-    metadata !== null &&
-    typeof metadata === 'object' &&
-    (metadata as { readonly planTelemetryResolved?: unknown }).planTelemetryResolved === true
-  );
+function formatAutoApprovedPlanForOutput(plan: string, path: string | undefined): string {
+  const savedTo = path !== undefined ? `Plan saved to: ${path}\n\n` : '';
+  return `Plan mode deactivated. All tools are now available.\nNote: this plan was auto-approved without user review — the user has NOT explicitly approved it. Follow the user's original instructions on whether to proceed with execution; if they asked you to stop, wait, or only summarize after planning, do not start executing.\n${savedTo}## Plan (auto-approved, not user-reviewed):\n${plan}`;
 }
 
 function formatPlanForOutput(plan: string, path: string | undefined): string {

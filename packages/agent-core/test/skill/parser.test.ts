@@ -1,6 +1,6 @@
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import path from 'node:path';
+import path from 'pathe';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -8,7 +8,7 @@ import {
   discoverSkills,
   expandSkillParameters,
   type SkillDefinition,
-  SkillRegistry,
+  SessionSkillRegistry,
   type SkillRoot,
 } from '../../src/skill';
 
@@ -29,6 +29,29 @@ describe('skill parser', () => {
     expect(skills).toHaveLength(1);
     expect(skills[0]?.name).toBe('my-thing');
     expect(skills[0]?.description).toBe('Something');
+  });
+
+  it('preserves plugin metadata from the skill root', async () => {
+    const root = await makeSkillsRoot();
+    await writeFlat(root, 'brainstorming.md', ['---', 'description: Brainstorm', '---', 'Body']);
+
+    const skills = await discoverSkills({
+      roots: [
+        {
+          path: root,
+          source: 'extra',
+          plugin: {
+            id: 'superpowers',
+            instructions: 'Use AskUserQuestion.',
+          },
+        },
+      ],
+    });
+
+    expect(skills[0]?.plugin).toEqual({
+      id: 'superpowers',
+      instructions: 'Use AskUserQuestion.',
+    });
   });
 
   it('falls back to the first non-empty body line as description when frontmatter is absent', async () => {
@@ -158,7 +181,7 @@ describe('skill parameter expansion', () => {
 
 describe('SkillRegistry.renderSkillPrompt', () => {
   it('expands argument placeholders without appending duplicate arguments', () => {
-    const rendered = new SkillRegistry().renderSkillPrompt(
+    const rendered = new SessionSkillRegistry().renderSkillPrompt(
       testSkill({
         content: 'Review $target from $ARGUMENTS.',
         metadata: { arguments: ['target'] },
@@ -171,7 +194,7 @@ describe('SkillRegistry.renderSkillPrompt', () => {
   });
 
   it('appends ARGUMENTS when the body has no argument placeholders', () => {
-    const rendered = new SkillRegistry().renderSkillPrompt(
+    const rendered = new SessionSkillRegistry().renderSkillPrompt(
       testSkill({ content: 'Review this file.' }),
       'src/app.ts',
     );
@@ -180,7 +203,7 @@ describe('SkillRegistry.renderSkillPrompt', () => {
   });
 
   it('expands context placeholders and still appends args when no argument placeholder is used', () => {
-    const rendered = new SkillRegistry({ sessionId: 'ses_1' }).renderSkillPrompt(
+    const rendered = new SessionSkillRegistry({ sessionId: 'ses_1' }).renderSkillPrompt(
       testSkill({ content: 'Use ${KIMI_SKILL_DIR}/references/checklist.md.' }),
       'src/app.ts',
     );
@@ -191,7 +214,7 @@ describe('SkillRegistry.renderSkillPrompt', () => {
   });
 
   it('does not treat longer variable names as declared argument placeholders', () => {
-    const rendered = new SkillRegistry().renderSkillPrompt(
+    const rendered = new SessionSkillRegistry().renderSkillPrompt(
       testSkill({
         content: 'Leave $targeted alone.',
         metadata: { arguments: ['target'] },
@@ -203,7 +226,7 @@ describe('SkillRegistry.renderSkillPrompt', () => {
   });
 
   it('accepts space-separated argument names', () => {
-    const rendered = new SkillRegistry().renderSkillPrompt(
+    const rendered = new SessionSkillRegistry().renderSkillPrompt(
       testSkill({
         content: 'Target: $target\nMode: $mode',
         metadata: { arguments: 'target mode' },
@@ -215,7 +238,7 @@ describe('SkillRegistry.renderSkillPrompt', () => {
   });
 
   it('ignores numeric argument names so positional placeholders keep shell-like semantics', () => {
-    const rendered = new SkillRegistry().renderSkillPrompt(
+    const rendered = new SessionSkillRegistry().renderSkillPrompt(
       testSkill({
         content: 'Zero: $0\nOne: $1',
         metadata: { arguments: ['1'] },
@@ -224,6 +247,25 @@ describe('SkillRegistry.renderSkillPrompt', () => {
     );
 
     expect(rendered).toBe('Zero: first\nOne: second');
+  });
+
+  it('prepends plugin instructions when a skill came from a plugin root', () => {
+    const rendered = new SessionSkillRegistry().renderSkillPrompt(
+      testSkill({
+        content: 'Brainstorm body.',
+        plugin: {
+          id: 'superpowers',
+          instructions: 'Use AskUserQuestion for clarifying questions.',
+        },
+      }),
+      '',
+    );
+
+    expect(rendered).toBe(
+      '<kimi-plugin-instructions plugin="superpowers">\n' +
+        'Use AskUserQuestion for clarifying questions.\n' +
+        '</kimi-plugin-instructions>\n\nBrainstorm body.',
+    );
   });
 });
 
@@ -257,6 +299,7 @@ async function writeFlatOrSubdirSkill(
 function testSkill(input: {
   readonly content: string;
   readonly metadata?: SkillDefinition['metadata'];
+  readonly plugin?: SkillDefinition['plugin'];
 }): SkillDefinition {
   return {
     name: 'review',
@@ -266,5 +309,6 @@ function testSkill(input: {
     content: input.content,
     metadata: input.metadata ?? {},
     source: 'user',
+    plugin: input.plugin,
   };
 }

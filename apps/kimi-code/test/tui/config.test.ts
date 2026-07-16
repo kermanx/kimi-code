@@ -32,9 +32,11 @@ describe('TUI config', () => {
 
     expect(result).toEqual(DEFAULT_TUI_CONFIG);
     const text = readFileSync(filePath, 'utf-8');
-    expect(text).toContain('Terminal UI preferences for kimi-code.');
+    expect(text).toContain('Client preferences for kimi-code.');
     expect(text).toContain('theme = "auto"');
     expect(text).toContain('command = ""');
+    expect(text).toContain('[upgrade]');
+    expect(text).toContain('auto_install = true');
     expect(text).toContain('[notifications]');
     expect(text).toContain('enabled = true');
     expect(text).toContain('notification_condition = "unfocused"');
@@ -50,13 +52,27 @@ command = "code --wait"
 [notifications]
 enabled = false
 notification_condition = "always"
+
+[upgrade]
+auto_install = false
 `);
 
     expect(config).toEqual({
       theme: 'light',
+      disablePasteBurst: false,
       editorCommand: 'code --wait',
       notifications: { enabled: false, condition: 'always' },
+      upgrade: { autoInstall: false },
     });
+  });
+
+  it('parses disable_paste_burst', () => {
+    const config = parseTuiConfig(`
+theme = "dark"
+disable_paste_burst = true
+`);
+
+    expect(config.disablePasteBurst).toBe(true);
   });
 
   it('normalizes an empty editor command to auto-detect', () => {
@@ -67,8 +83,10 @@ command = "   "
 
     expect(config).toEqual({
       theme: 'auto',
+      disablePasteBurst: false,
       editorCommand: null,
       notifications: { enabled: true, condition: 'unfocused' },
+      upgrade: { autoInstall: true },
     });
   });
 
@@ -76,6 +94,7 @@ command = "   "
     const config = parseTuiConfig(`theme = "dark"`);
 
     expect(config.notifications).toEqual({ enabled: true, condition: 'unfocused' });
+    expect(config.upgrade).toEqual({ autoInstall: true });
   });
 
   it('throws TuiConfigParseError with fallback when parsing fails, leaving the file untouched', async () => {
@@ -96,16 +115,36 @@ command = "   "
     await saveTuiConfig(
       {
         theme: 'light',
+        disablePasteBurst: false,
         editorCommand: 'vim',
         notifications: { enabled: false, condition: 'always' },
+        upgrade: { autoInstall: false },
       },
       filePath,
     );
 
     expect(await loadTuiConfig(filePath)).toEqual({
       theme: 'light',
+      disablePasteBurst: false,
       editorCommand: 'vim',
       notifications: { enabled: false, condition: 'always' },
+      upgrade: { autoInstall: false },
     });
+  });
+
+  it('escapes special characters in a custom theme name so the TOML round-trips', async () => {
+    const theme = 'weird"name\\with-quote';
+    await saveTuiConfig(
+      {
+        theme,
+        disablePasteBurst: DEFAULT_TUI_CONFIG.disablePasteBurst,
+        editorCommand: null,
+        notifications: DEFAULT_TUI_CONFIG.notifications,
+        upgrade: DEFAULT_TUI_CONFIG.upgrade,
+      },
+      filePath,
+    );
+
+    expect((await loadTuiConfig(filePath)).theme).toBe(theme);
   });
 });

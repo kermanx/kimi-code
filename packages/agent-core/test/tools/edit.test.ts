@@ -11,19 +11,44 @@ function context(args: EditInput) {
 }
 
 describe('EditTool', () => {
+  it('exposes before/after on the file_io display so the approval panel can render a diff', () => {
+    const tool = new EditTool(createFakeKaos(), PERMISSIVE_WORKSPACE);
+    const execution = tool.resolveExecution({
+      path: '/tmp/foo.ts',
+      old_string: 'a\nb\nc',
+      new_string: 'a\nB\nc',
+    });
+    if (execution.isError === true) {
+      throw new TypeError('expected runnable execution');
+    }
+    expect(execution.display).toEqual({
+      kind: 'file_io',
+      operation: 'edit',
+      path: '/tmp/foo.ts',
+      before: 'a\nb\nc',
+      after: 'a\nB\nc',
+    });
+  });
+
   it('exposes current metadata and schema', () => {
     const tool = new EditTool(createFakeKaos(), PERMISSIVE_WORKSPACE);
 
     expect(tool.name).toBe('Edit');
-    expect(tool.description).toContain('text view returned by Read');
-    expect(tool.description).toContain('omit the line-number prefix');
-    expect(tool.description).toContain('old_string must occur exactly once');
-    expect(tool.description).toContain('multiple Edit calls in parallel');
-    // Editing files should go through Edit, not a Shell `sed` command.
-    expect(tool.description).toContain('Shell `sed`');
+    expect(tool.description).toContain('Read the target file before every Edit');
+    expect(tool.description).toContain('DO NOT call Edit from memory');
+    expect(tool.description).toContain('Read output view');
+    expect(tool.description).toContain('line-number prefix');
+    expect(tool.description).toContain('`old_string` must be unique');
+    expect(tool.description).toContain('only when they do not target the same file');
+    expect(tool.description).toContain('DO NOT issue consecutive Edit calls on the same file');
+    // replace_all should be framed with its positive rename-across-file use-case.
+    expect(tool.description.toLowerCase()).toContain('renam');
+    // Editing files should go through Edit, not Write and not a Bash `sed`
+    // command. The prompt names both alternatives explicitly.
+    expect(tool.description).toContain('DO NOT use Write or Bash `sed`');
     // Parallel Edit calls on the same file are serialized and applied in
     // response order; mismatched old_string fails explicitly.
-    expect(tool.description).toContain('they apply in the order the calls appear in your response');
+    expect(tool.description).toContain('same-file edits in response order');
     expect(tool.description).toContain('old_string not found');
     expect(tool.parameters).toMatchObject({
       type: 'object',
